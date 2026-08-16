@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""ytdl — download audio or video from YouTube, and say what it is doing.
+
+yt-dlp does the downloading. This exists for the talking: yt-dlp's own progress
+bar rewrites one terminal line many times a second, so a screen reader spends
+the whole download interrupting itself and never finishes a sentence. Here you
+get one line per event and silence in between.
+
+    ytdl <url>              best audio, original codec, into iCloud
+    ytdl                    take the URL from the clipboard
+    ytdl <url> --info       title, length, formats — download nothing
+
+    --video                 best video and audio, merged to MP4
+    --mp3                   transcode to MP3 320 (costs a lossy generation)
+    --wav                   decode to WAV, ready for a REAPER session
+    --to PATH               somewhere other than the iCloud folder
+    --name "..."            set the filename yourself
+    --playlist              opt in to the whole playlist
+    --progress              a percentage line every 10 seconds, no faster
+    --cookies [BROWSER]     sign-in cookies, for "confirm you're not a bot"
+    --notify                Pushover ping when it finishes
+    --quiet                 print the final path and nothing else
+    --update                brew upgrade yt-dlp, and say what changed
+
+The default never re-encodes. YouTube's best audio is usually Opus around
+160 kbps, which beats its 128 kbps AAC, so the codec is kept as it came and
+only the container changes: AAC lands as .m4a, Opus as .opus. --mp3 and --wav
+are conversions and are named as such.
+
+Downloads land in iCloud Drive, in "Youtube Downloads". Part-files never do —
+they go to a local scratch directory, so half a download is never synced to
+your phone and then deleted.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+DEST = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs",
+                    "Youtube Downloads")
+SCRATCH = os.path.join(HOME, ".cache", "ytdl-temp")
+PUSHOVER = os.path.join(HOME, "bin", "pushover")
+
+RELEASES = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+
+# Custom Pushover uploads, so the 21 built-in tones are untouched. Tier 4 for
+# the finish, tier 2 for the failure, which is why only the failure raises
+# priority — a download that did not happen is the one worth interrupting for.
+SOUND_DONE = "ytdl-done"
+SOUND_FAIL = "ytdl-fail"
+
+MARK = "YTDLFILE:"
+PROGRESS_EVERY = 10.0  # seconds — a rate a screen reader can finish speaking
+
+
+# ---------------------------------------------------------------- speaking
+
+def say(text=""):
+    """One write per thing said. Flushed, so nothing arrives out of order."""
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def spoken_duration(seconds):
+    try:
+        seconds = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if hours:
+        parts.append("%d hour%s" % (hours, "" if hours == 1 else "s"))
+    if minutes:
+        parts.append("%d minute%s" % (minutes, "" if minutes == 1 else "s"))
+    if secs and not hours:
+        parts.append("%d second%s" % (secs, "" if secs == 1 else "s"))
+    return " ".join(parts) if parts else "%d seconds" % seconds
+
+
+def spoken_size(num_bytes):
+    try:
+        num_bytes = float(num_bytes)
+    except (TypeError, ValueError):
+        return None
+    if num_bytes <= 0:
+        return None
+    for unit, cutoff in (("GB", 1024 ** 3), ("MB", 1024 ** 2), ("KB", 1024)):
+        if num_bytes >= cutoff:
+            value = num_bytes / cutoff
+            return "%.1f %s" % (value, unit) if value < 10 else "%d %s" % (round(value), unit)
+    return "%d bytes" % int(num_bytes)
+
+
+# ---------------------------------------------------------------- yt-dlp
+
+def yt_dlp_path():
+    path = shutil.which("yt-dlp")
+    if not path:
+        sys.exit("yt-dlp is not installed. Install it with:  brew install yt-dlp")
+    return path
+
+
+def yt_dlp_version():
+    try:
+        out = subprocess.run([yt_dlp_path(), "--version"], capture_output=True,
+                             text=True, timeout=30)
+        return out.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def latest_release():
+    """The newest yt-dlp release, or None if we could not find out.
+
+    Silent on failure, deliberately: "could not check" and "you are behind"
+    must never look the same. This replaced an age-in-days heuristic, which
+    called a perfectly current install stale simply because yt-dlp had not
+    released in a while — a warning that fires on every failure and points at
+    a fix that does nothing is how you teach someone to ignore it.
+    """
+    try:
+        req = urllib.request.Request(
+            RELEASES, headers={"Accept": "application/vnd.github+json",
+                               "User-Agent": "ytdl"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp).get("tag_name") or None
+    except Exception:
+        return None
+
+
+def behind_upstream():
+    """(installed, latest) only when genuinely behind. (None, None) otherwise."""
+    installed = yt_dlp_version()
+    latest = latest_release()
+    if installed and latest and installed.lstrip("v") != latest.lstrip("v"):
+        return installed, latest
+    return None, None
+
+
+# ---------------------------------------------------------------- input
+
+def url_from_clipboard():
+    try:
+        out = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = (out.stdout or "").strip()
+    return text.split()[0] if text else None
+
+
+def check_url(url):
+    """Validated before anything is run, so a bad paste fails as a sentence."""
+    if not url:
+        sys.exit("No URL given, and nothing on the clipboard.\n"
+                 "Copy a link and run ytdl again, or pass one:  ytdl <url>")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        sys.exit("That does not look like a web address:\n  %s\n"
+                 "Copy the link itself, not the page title." % url[:200])
+    return url
+
+
+def in_a_playlist(url):
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    return bool(query.get("list"))
+
+
+def playlist_size(url):
+    """Count without fetching the entries. Best effort — None is fine."""
+    try:
+        out = subprocess.run(
+            [yt_dlp_path(), "--flat-playlist", "--playlist-items", "0",
+             "--no-warnings", "-J", url],
+            capture_output=True, text=True, timeout=45)
+        if out.returncode != 0:
+            return None
+        return json.loads(out.stdout).get("playlist_count")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def selector(args):
+    """The format selector, shared by --info and the download itself.
+
+    Both paths use this so --info can never describe a different stream from
+    the one that would actually arrive.
+    """
+    if args.video:
+        return ["-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b"]
+    return ["-f", "bestaudio"]
+
+
+def fetch_info(url, cookies, fmt=None):
+    cmd = [yt_dlp_path(), "-J", "--no-playlist", "--no-warnings"]
+    cmd += fmt or []
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    cmd.append(url)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "Could not reach that URL — it timed out."
+    if out.returncode != 0:
+        return None, out.stderr.strip()
+    try:
+        return json.loads(out.stdout), None
+    except ValueError:
+        return None, "yt-dlp returned something that was not readable."
+
+
+# ---------------------------------------------------------------- errors
+
+def explain_failure(text, cookies_used):
+    """Say the useful thing, not yt-dlp's error, whenever we recognise it."""
+    lowered = (text or "").lower()
+    lines = []
+
+    if "confirm you" in lowered or "not a bot" in lowered or "http error 403" in lowered:
+        if cookies_used:
+            lines.append("YouTube refused the download even with browser cookies.")
+            lines.append("Try a different browser:  ytdl <url> --cookies safari")
+        else:
+            lines.append("YouTube wants a signed-in browser for this one.")
+            lines.append("Try:  ytdl <url> --cookies")
+    elif "private video" in lowered or "is private" in lowered:
+        lines.append("That video is private.")
+    elif "unavailable" in lowered or "removed" in lowered or "does not exist" in lowered:
+        # Matched loosely on purpose: yt-dlp words this several ways ("video
+        # unavailable", "This video is unavailable"), and an exact phrase match
+        # silently drops back to dumping a raw traceback-ish error.
+        lines.append("That video is not available — removed, private, or blocked here.")
+    elif "members-only" in lowered or "join this channel" in lowered:
+        lines.append("That video is members-only.")
+    elif "no space left" in lowered:
+        lines.append("The disk is full.")
+    else:
+        lines.append("That failed.")
+        tail = [ln for ln in (text or "").splitlines() if ln.strip()][-3:]
+        lines += ["  " + ln.strip() for ln in tail]
+
+    installed, latest = behind_upstream()
+    if latest:
+        lines.append("")
+        lines.append("Also, this yt-dlp is %s and %s is out. YouTube breaks it often."
+                     % (installed, latest))
+        lines.append("Worth trying:  ytdl --update")
+    return "\n".join(lines)
+
+
+def notify(text, sound=SOUND_DONE):
+    """Ping, and fall back to the default tone rather than losing the message.
+
+    Pushover rejects the *entire* notification for an unknown sound name, so a
+    tone that has not been uploaded yet would cost the ping, not just its
+    sound. Retrying bare is cheaper than caching the sound list for something
+    this infrequent.
+    """
+    if not os.path.exists(PUSHOVER):
+        return
+    base = [PUSHOVER, "send", text, "--title", "ytdl"]
+    if sound == SOUND_FAIL:
+        base += ["--priority", "1"]
+    for cmd in ([base + ["--sound", sound]] if sound else []) + [base]:
+        try:
+            out = subprocess.run(cmd, capture_output=True, timeout=30)
+            if out.returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            return  # a failed ping must never look like a failed download
+
+
+# ---------------------------------------------------------------- commands
+
+def do_update():
+    before = yt_dlp_version()
+    say("Updating yt-dlp...")
+    try:
+        out = subprocess.run(["brew", "upgrade", "yt-dlp"],
+                             capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired):
+        sys.exit("The update did not finish. Try it by hand:  brew upgrade yt-dlp")
+    after = yt_dlp_version()
+    if after and before and after != before:
+        say("Updated from %s to %s." % (before, after))
+    else:
+        say("Already at %s." % (after or "an unknown version"))
+
+    # Say whether that is genuinely current, so "already up to date" cannot be
+    # mistaken for "Homebrew has stopped tracking it".
+    latest = latest_release()
+    if not latest:
+        say("Could not check against yt-dlp's own releases just now.")
+    elif after and after.lstrip("v") == latest.lstrip("v"):
+        say("That is the current release — nothing newer exists.")
+    else:
+        say("Homebrew is behind: yt-dlp's current release is %s." % latest)
+        say("For the newest build:  brew install --HEAD yt-dlp")
+
+
+def describe(info):
+    """The two lines said before every download: what it is, and how big."""
+    title = info.get("title") or "Untitled"
+    uploader = info.get("uploader") or info.get("channel")
+    say("%s%s" % (title, " — %s" % uploader if uploader else ""))
+
+    bits = []
+    length = spoken_duration(info.get("duration"))
+    if length:
+        bits.append(length)
+    size = spoken_size(info.get("filesize_approx") or info.get("filesize"))
+    if size:
+        bits.append("about %s" % size)
+    if bits:
+        say(". ".join(bits) + ".")
+    return title
+
+
+def do_info(info):
+    describe(info)
+    when = info.get("upload_date")
+    if when and len(when) == 8:
+        say("Uploaded %s-%s-%s." % (when[0:4], when[4:6], when[6:8]))
+
+    # What yt-dlp itself selected, not our own guess at its ranking. It sorts
+    # on codec efficiency before raw bitrate, so Opus at 106k beats AAC at
+    # 130k — re-implementing that here would describe the wrong stream.
+    streams = info.get("requested_formats") or [info]
+    for stream in streams:
+        acodec = stream.get("acodec")
+        vcodec = stream.get("vcodec")
+        if vcodec and vcodec != "none":
+            say("Video: %s, %sp." % (vcodec, stream.get("height") or "?"))
+        if acodec and acodec != "none":
+            abr = stream.get("abr")
+            say("Audio: %s%s." % (acodec, ", %d kbps" % round(abr) if abr else ""))
+    say()
+    say("That is what would be downloaded. Nothing was — that was --info.")
+
+
+def build_command(args, url):
+    cmd = [yt_dlp_path(),
+           "-P", "home:%s" % args.to,
+           "-P", "temp:%s" % SCRATCH,
+           "--trim-filenames", "180",
+           "--no-warnings",
+           "--print", "after_move:%s%%(filepath)s" % MARK]
+
+    if args.name:
+        cmd += ["-o", "%s.%%(ext)s" % args.name]
+    elif args.playlist:
+        cmd += ["-o", "%(playlist_title)s/%(playlist_index)02d - %(title)s.%(ext)s"]
+    else:
+        cmd += ["-o", "%(title)s.%(ext)s"]
+
+    cmd.append("--yes-playlist" if args.playlist else "--no-playlist")
+
+    if args.video:
+        # Prefer streams that merge by stream copy rather than re-encode.
+        cmd += ["-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
+                "--merge-output-format", "mp4"]
+    elif args.mp3:
+        cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "320K",
+                "--embed-metadata"]
+    elif args.wav:
+        cmd += ["-x", "--audio-format", "wav"]
+    else:
+        # "best" here means keep the source codec — container change only.
+        cmd += ["-x", "--audio-format", "best", "--embed-metadata"]
+
+    if args.cookies:
+        cmd += ["--cookies-from-browser", args.cookies]
+
+    if args.progress:
+        cmd += ["--newline", "--progress-template",
+                "download:PROGRESS %(progress._percent_str)s %(progress._eta_str)s"]
+    else:
+        cmd.append("--no-progress")
+
+    cmd.append(url)
+    return cmd
+
+
+def run_download(cmd, args):
+    import time
+
+    files, tail = [], []
+    last_spoken = 0.0
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except OSError as exc:
+        sys.exit("Could not start yt-dlp: %s" % exc)
+
+    try:
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith(MARK):
+                files.append(line[len(MARK):])
+                continue
+            tail.append(line)
+            del tail[:-40]
+            if line.startswith("PROGRESS "):
+                now = time.time()
+                if now - last_spoken >= PROGRESS_EVERY:
+                    last_spoken = now
+                    parts = line.split()
+                    pct = parts[1] if len(parts) > 1 else "?"
+                    eta = parts[2] if len(parts) > 2 else ""
+                    say("  %s%s" % (pct.strip(),
+                                    ", %s left" % eta if eta and eta != "NA" else ""))
+            elif "has already been downloaded" in line:
+                say("Already downloaded — leaving the existing file alone.")
+    except KeyboardInterrupt:
+        proc.terminate()
+        say()
+        say("Stopped. Nothing was left in Youtube Downloads.")
+        return 130, files, tail
+    finally:
+        proc.stdout.close()
+    return proc.wait(), files, tail
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("url", nargs="?", help="the link (default: the clipboard)")
+    ap.add_argument("--to", default=DEST, help="destination folder")
+    ap.add_argument("--name", help="filename, without extension")
+    ap.add_argument("--video", action="store_true", help="video and audio, merged to MP4")
+    ap.add_argument("--mp3", action="store_true", help="transcode to MP3 320")
+    ap.add_argument("--wav", action="store_true", help="decode to WAV")
+    ap.add_argument("--playlist", action="store_true", help="take the whole playlist")
+    ap.add_argument("--info", action="store_true", help="describe it, download nothing")
+    ap.add_argument("--progress", action="store_true", help="a percentage every 10s")
+    ap.add_argument("--cookies", nargs="?", const="chrome", metavar="BROWSER",
+                    help="use sign-in cookies from a browser (default chrome)")
+    ap.add_argument("--notify", action="store_true", help="Pushover ping when done")
+    ap.add_argument("--quiet", action="store_true", help="print only the final path")
+    ap.add_argument("--update", action="store_true", help="brew upgrade yt-dlp")
+    args = ap.parse_args()
+
+    if args.update:
+        do_update()
+        return
+
+    if sum([args.video, args.mp3, args.wav]) > 1:
+        sys.exit("Pick one of --video, --mp3 or --wav, not several.")
+
+    url = check_url(args.url or url_from_clipboard())
+    args.to = os.path.abspath(os.path.expanduser(args.to))
+
+    if not args.url and not args.quiet:
+        say("Using the URL on the clipboard.")
+
+    info, error = fetch_info(url, args.cookies, selector(args))
+    if info is None:
+        # Private, unavailable, or a bot check — this is the *common* failure,
+        # and it lands before the download, so it needs the ping just as much.
+        if args.notify:
+            notify("Download failed: %s" % url[:120], SOUND_FAIL)
+        sys.exit(explain_failure(error, bool(args.cookies)))
+
+    if args.info:
+        do_info(info)
+        return
+
+    if not args.quiet:
+        describe(info)
+        if in_a_playlist(url) and not args.playlist:
+            count = playlist_size(url)
+            say("That link is part of a playlist%s — taking just this one." %
+                (" of %d videos" % count if count else ""))
+            say("Add --playlist for the whole list.")
+        say("Downloading...")
+
+    os.makedirs(args.to, exist_ok=True)
+    os.makedirs(SCRATCH, exist_ok=True)
+
+    code, files, tail = run_download(build_command(args, url), args)
+
+    if code == 130:
+        return
+    if code != 0:
+        # Silence is the worst outcome for a download started from the phone,
+        # so the failure pings too — and at priority 1, unlike the finish.
+        if args.notify:
+            notify("Download failed: %s" % (info.get("title") or url)[:120], SOUND_FAIL)
+        sys.exit(explain_failure("\n".join(tail), bool(args.cookies)))
+
+    # Leave no fragments behind — the whole point of the split paths.
+    try:
+        for leftover in os.listdir(SCRATCH):
+            path = os.path.join(SCRATCH, leftover)
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+    except OSError:
+        pass
+
+    if not files:
+        say("Finished, but yt-dlp did not report a filename. Check %s" % args.to)
+        return
+
+    if args.quiet:
+        for path in files:
+            say(path)
+        return
+
+    say()
+    if len(files) == 1:
+        name = os.path.basename(files[0])
+        size = spoken_size(os.path.getsize(files[0])) if os.path.exists(files[0]) else None
+        say("Done. Saved to %s as %s%s" %
+            (os.path.basename(args.to), name, " (%s)" % size if size else ""))
+    else:
+        say("Done. %d files saved to %s" % (len(files), os.path.basename(args.to)))
+
+    if args.notify:
+        notify("Downloaded %s" % (os.path.basename(files[0]) if len(files) == 1
+                                  else "%d files" % len(files)))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        say()
+        sys.exit(130)
