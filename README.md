@@ -71,8 +71,11 @@ ytdl <url> --info          what you would get, downloads nothing
   --cookies [BROWSER]      sign-in cookies, for "confirm you're not a bot"
   --notify                 Pushover ping on finish and on failure
   --quiet                  print the final path and nothing else
-  --update                 upgrade yt-dlp, and say what actually changed
+  --update                 upgrade yt-dlp now, and say what actually changed
+  --no-auto-update         never upgrade yt-dlp on its own
 ```
+
+yt-dlp keeps itself current without being asked — see below.
 
 Downloads default to `~/Library/Mobile Documents/com~apple~CloudDocs/Youtube Downloads`
 (iCloud Drive). Change it per run with `--to`, or edit `DEST` at the top of the script.
@@ -104,12 +107,30 @@ on the end. Honouring that silently would drop a few hundred files on you. The c
 comes from `--flat-playlist --playlist-items 0`, which reports `playlist_count`
 without fetching the entries.
 
+**Auto-update is triggered by failure, not by a timer.** YouTube breaks yt-dlp
+periodically, and the moment a newer version is worth having is the moment a download
+fails. So that is the primary trigger: on a failure, if a newer release exists, `ytdl`
+upgrades and retries once — turning "it failed, go update, try again" into one command
+that just works.
+
+Two guards make that safe to leave on. It only fires for failures an upgrade could
+plausibly fix — a private, removed or members-only video will fail identically on
+every version ever released, and spending a minute on `brew` to prove that is worse
+than just saying so. And it only retries when the version genuinely moved, so a
+Homebrew that has nothing newer costs you one no-op rather than a pointless second
+attempt.
+
+The secondary trigger is a once-a-day check **after a successful download**, so the
+upgrade has usually already happened before a break can reach you. Neither check ever
+runs *before* a download — nothing should stand between you and the file you asked
+for. `--no-auto-update` turns both off.
+
 **No age-based staleness check.** An early version warned when yt-dlp was more than
-30 days old, since YouTube breaks extraction regularly. But yt-dlp releases
-irregularly, so this called a perfectly current install stale — the warning fired on
-every failure and pointed at `--update`, which correctly replied "already up to date".
-It now compares against the GitHub releases API, and **stays silent when it cannot
-reach it**: "could not check" and "you are behind" must never look the same.
+30 days old. But yt-dlp releases irregularly, so this called a perfectly current
+install stale — the warning fired on every failure and pointed at `--update`, which
+correctly replied "already up to date". Version comparison is against the GitHub
+releases API, and **stays silent when it cannot reach it**: "could not check" and
+"you are behind" must never look the same.
 
 **The app exports PATH before doing anything.** A GUI-launched macOS app inherits a
 minimal `PATH` of `/usr/bin:/bin:/usr/sbin:/sbin`, with no Homebrew in it — so yt-dlp

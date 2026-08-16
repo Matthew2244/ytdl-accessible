@@ -20,7 +20,14 @@ get one line per event and silence in between.
     --cookies [BROWSER]     sign-in cookies, for "confirm you're not a bot"
     --notify                Pushover ping when it finishes
     --quiet                 print the final path and nothing else
-    --update                brew upgrade yt-dlp, and say what changed
+    --update                brew upgrade yt-dlp now, and say what changed
+    --no-auto-update        never upgrade yt-dlp on its own
+
+yt-dlp keeps itself current without being asked. It upgrades when a download
+fails and a newer release exists — the moment it actually matters — and again
+at most once a day after a *successful* download, so the upgrade has usually
+already happened before a break can reach you. Neither check ever runs before
+a download: nothing stands between you and the file you asked for.
 
 The default never re-encodes. YouTube's best audio is usually Opus around
 160 kbps, which beats its 128 kbps AAC, so the codec is kept as it came and
@@ -33,11 +40,13 @@ your phone and then deleted.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -48,6 +57,12 @@ SCRATCH = os.path.join(HOME, ".cache", "ytdl-temp")
 PUSHOVER = os.path.join(HOME, "bin", "pushover")
 
 RELEASES = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+
+# Auto-update. The proactive check runs after a *successful* download, never
+# before one, so it can never stand between you and the thing you asked for.
+CHECK_STAMP = os.path.join(HOME, ".cache", "ytdl-update-check")
+LOCKFILE = os.path.join(HOME, ".cache", "ytdl-update.lock")
+CHECK_EVERY = 24 * 60 * 60
 
 # Custom Pushover uploads, so the 21 built-in tones are untouched. Tier 4 for
 # the finish, tier 2 for the failure, which is why only the failure raises
@@ -215,6 +230,81 @@ def fetch_info(url, cookies, fmt=None):
         return json.loads(out.stdout), None
     except ValueError:
         return None, "yt-dlp returned something that was not readable."
+
+
+# ---------------------------------------------------------------- updating
+
+def worth_updating_for(text):
+    """Would a newer yt-dlp plausibly fix this failure?
+
+    A private, removed or members-only video will fail identically on every
+    version ever released. Spending a minute on `brew upgrade` to prove that
+    is worse than just saying so — so the auto-update only fires on failures
+    that extraction breakage could actually explain.
+    """
+    lowered = (text or "").lower()
+    hopeless = ("private", "unavailable", "removed", "members-only",
+                "join this channel", "does not exist", "no space left",
+                "not a valid url")
+    return not any(word in lowered for word in hopeless)
+
+
+def update_due():
+    """True at most once a day, so the proactive check is nearly free."""
+    try:
+        with open(CHECK_STAMP) as fh:
+            return (time.time() - float(fh.read().strip())) > CHECK_EVERY
+    except (OSError, ValueError):
+        return True  # never checked, or unreadable — check now
+
+
+def stamp_check():
+    try:
+        os.makedirs(os.path.dirname(CHECK_STAMP), exist_ok=True)
+        with open(CHECK_STAMP, "w") as fh:
+            fh.write("%d" % time.time())
+    except OSError:
+        pass  # a lost stamp costs an extra check, nothing more
+
+
+def auto_update(preamble=""):
+    """Upgrade yt-dlp if it is genuinely behind. Returns the new version, or None.
+
+    Locked, because two ytdl runs upgrading Homebrew at once is a good way to
+    get a broken install out of a feature meant to prevent one.
+    """
+    installed, latest = behind_upstream()
+    stamp_check()
+    if not latest:
+        return None
+
+    try:
+        lock = open(LOCKFILE, "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        return None  # another run is already doing it
+
+    try:
+        say()
+        say("%syt-dlp is %s and %s is out — updating." % (preamble, installed, latest))
+        try:
+            subprocess.run(["brew", "upgrade", "yt-dlp"],
+                           capture_output=True, timeout=900)
+        except (OSError, subprocess.TimeoutExpired):
+            say("The update did not finish. Carrying on with %s." % installed)
+            return None
+        after = yt_dlp_version()
+        if after and after != installed:
+            say("Now on %s." % after)
+            return after
+        say("Homebrew has nothing newer than %s yet." % installed)
+        return None
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        except (OSError, IOError):
+            pass
 
 
 # ---------------------------------------------------------------- errors
@@ -445,6 +535,8 @@ def main():
     ap.add_argument("--playlist", action="store_true", help="take the whole playlist")
     ap.add_argument("--info", action="store_true", help="describe it, download nothing")
     ap.add_argument("--progress", action="store_true", help="a percentage every 10s")
+    ap.add_argument("--no-auto-update", dest="auto_update", action="store_false",
+                    help="never upgrade yt-dlp on its own")
     ap.add_argument("--cookies", nargs="?", const="chrome", metavar="BROWSER",
                     help="use sign-in cookies from a browser (default chrome)")
     ap.add_argument("--notify", action="store_true", help="Pushover ping when done")
@@ -493,12 +585,25 @@ def main():
 
     if code == 130:
         return
+
     if code != 0:
-        # Silence is the worst outcome for a download started from the phone,
-        # so the failure pings too — and at priority 1, unlike the finish.
-        if args.notify:
-            notify("Download failed: %s" % (info.get("title") or url)[:120], SOUND_FAIL)
-        sys.exit(explain_failure("\n".join(tail), bool(args.cookies)))
+        # A failure is the moment a newer yt-dlp is actually worth having, so
+        # this is where the auto-update earns its keep — not on a timer. It
+        # only fires for failures an upgrade could plausibly fix, and only
+        # retries when the version genuinely moved.
+        text = "\n".join(tail)
+        if args.auto_update and worth_updating_for(text):
+            if auto_update("That failed. "):
+                say("Trying again...")
+                code, files, tail = run_download(build_command(args, url), args)
+                text = "\n".join(tail)
+        if code != 0:
+            # Silence is the worst outcome for a download started from the
+            # phone, so the failure pings too — at priority 1, unlike a finish.
+            if args.notify:
+                notify("Download failed: %s" % (info.get("title") or url)[:120],
+                       SOUND_FAIL)
+            sys.exit(explain_failure(text, bool(args.cookies)))
 
     # Leave no fragments behind — the whole point of the split paths.
     try:
@@ -532,6 +637,14 @@ def main():
     if args.notify:
         notify("Downloaded %s" % (os.path.basename(files[0]) if len(files) == 1
                                   else "%d files" % len(files)))
+
+    # The proactive half, once a day, and deliberately *after* the download —
+    # so the common case is that the upgrade already happened by the time a
+    # break would have hit you, and the rare case is a minute of brew you were
+    # not waiting on anyway. Never before: nothing should stand between you
+    # and the file you asked for.
+    if args.auto_update and update_due():
+        auto_update()
 
 
 if __name__ == "__main__":
