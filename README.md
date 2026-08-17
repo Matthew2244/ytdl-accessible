@@ -1,12 +1,42 @@
 # ytdl-accessible
 
-A screen-reader-friendly wrapper around [yt-dlp](https://github.com/yt-dlp/yt-dlp) for macOS,
-plus a small app so it can be launched from the Applications folder, and a tool that
-produces audio description for a video.
+**Download audio and video from the web, on a Mac, without fighting your screen reader.**
 
-**Not YouTube-only.** yt-dlp handles about 1,750 sites — Bandcamp, SoundCloud, Vimeo,
-the BBC, archive.org, Mixcloud — and falls back to a generic attempt on any plain media
-link. `ytdl --sites bandcamp` checks a specific one.
+It saves the file where you tell it and leaves it alone. It never opens or plays
+anything.
+
+Works on about 1,750 sites — YouTube, Bandcamp, SoundCloud, Vimeo, the BBC,
+archive.org, Mixcloud — and on plain links to a media file.
+
+You get three things:
+
+- **`ytdl`** — a command that says what it is doing in whole sentences
+- **Media Download** — an app in your Applications folder, if you would rather click
+- **`ytdescribe`** — audio description for a video (see the end)
+
+## Install
+
+```bash
+git clone https://github.com/Matthew2244/ytdl-accessible.git
+cd ytdl-accessible
+./install.sh
+```
+
+That checks for [Homebrew](https://brew.sh), installs `yt-dlp` and `ffmpeg` if you
+do not have them, puts the commands somewhere on your PATH, and builds the app. It
+never uses `sudo`. If it needs you to do something — like adding a folder to your
+PATH — it says so in plain words at the end.
+
+To remove everything later: `./install.sh --uninstall`
+
+Then either open **Media Download** from your Applications folder, or copy a link
+and run:
+
+```bash
+ytdl
+```
+
+`ytdl --setup` walks you through where downloads go and what format you want.
 
 ## Why this exists
 
@@ -35,33 +65,13 @@ Everything else here follows from the same idea: errors are sentences rather tha
 tracebacks, durations are "6 minutes 42 seconds" rather than `402`, and anything
 that would need a glance at a progress bar is instead reported when it matters.
 
-## Requirements
+## What it needs
 
-macOS, with [Homebrew](https://brew.sh):
+macOS and [Homebrew](https://brew.sh). The installer handles the rest.
 
-```bash
-brew install yt-dlp ffmpeg
-```
-
-Homebrew pulls in `deno` alongside yt-dlp, which is what satisfies YouTube's
-player challenge. Nothing else is needed.
-
-For `ytdescribe` you also want the `claude` CLI on your PATH (it reads the frames)
-and, for the spoken track, an ElevenLabs key in the macOS Keychain as
-`elevenlabs-api-key`. Both are optional; the text description needs only `claude`.
-
-## Install
-
-```bash
-git clone https://github.com/Matthew2244/ytdl-accessible.git ~/ytdl-accessible
-ln -s ~/ytdl-accessible/ytdl ~/bin/ytdl     # anywhere on your PATH
-```
-
-Optionally, build the Mac app:
-
-```bash
-osacompile -o "/Applications/Media Download.app" ~/ytdl-accessible/MediaDownload.applescript
-```
+`ytdescribe` additionally wants the `claude` CLI on your PATH to read the video
+frames, and an ElevenLabs key in the Keychain as `elevenlabs-api-key` if you want
+the description spoken. Both are optional — `ytdl` does not need either.
 
 ## Usage
 
