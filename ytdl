@@ -727,8 +727,17 @@ def build_command(args, url):
         cmd.append("--split-chapters")
 
     if args.subtitles:
-        cmd += ["--write-auto-subs", "--write-subs", "--sub-langs", "en.*",
-                "--convert-subs", "srt"]
+        # "en.*" looks right and is a trap: it matches every auto-*translated*
+        # track YouTube offers (en-de, en-fr, ...), which is dozens of requests
+        # and earns an HTTP 429 rather than a subtitle file. Name the real
+        # English tracks instead.
+        #
+        # -i as well, because subtitles are a bonus and a bonus must never cost
+        # the download itself — without it a failed subtitle fetch aborts the
+        # whole run and you get no media at all.
+        cmd += ["--write-auto-subs", "--write-subs",
+                "--sub-langs", "en,en-orig,en-US,en-GB",
+                "--convert-subs", "srt", "-i"]
 
     if args.cookies:
         cmd += ["--cookies-from-browser", args.cookies]

@@ -154,6 +154,13 @@ as the only way to find out. Each item is announced as it starts, an archive fil
 the downloads records what completed, and re-running the same command resumes rather
 than starting over.
 
+**`--sub-langs "en.*"` is a trap.** It looks like "any English track" and actually
+matches every auto-*translated* variant YouTube offers — `en-de`, `en-fr`, and dozens
+more. That is enough requests to earn an HTTP 429 instead of a subtitle file. The real
+English tracks are named explicitly. `-i` goes with it, because subtitles are a bonus
+and a bonus must never cost the download: without it, one failed subtitle fetch aborts
+the run and you get no media at all.
+
 **An exact format id is taken as it comes.** `--format-id 251` (Opus) once landed as a
 fatter, lossier `.m4a`, because a *saved default* of m4a was still being applied on top
 of the stream that had been explicitly named. A saved default must never silently
