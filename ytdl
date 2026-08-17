@@ -1073,6 +1073,58 @@ def do_update():
         say("For the newest build:  brew install --HEAD yt-dlp")
 
 
+PICK_CAP = 300
+
+
+def playlist_items(url, cookies=None):
+    """The entries in a playlist, flat and fast. [(n, title, duration)]."""
+    cmd = [yt_dlp_path(), "--flat-playlist", "-J", "--no-warnings", "--yes-playlist"]
+    if cookies:
+        cmd += ["--cookies-from-browser", cookies]
+    cmd.append(url)
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if out.returncode != 0:
+            return [], (out.stderr or "").strip()
+        data = json.loads(out.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return [], str(exc)
+    rows = []
+    for i, entry in enumerate(data.get("entries") or [], 1):
+        if not entry:
+            continue
+        rows.append((i, entry.get("title") or "Untitled", entry.get("duration")))
+    return rows, None
+
+
+def do_list_items(url, cookies, plain):
+    """Number every entry so you can say which ones you want.
+
+    Printed rather than guessed at: --items takes numbers, and numbers are
+    useless until you can see what they refer to.
+    """
+    rows, err = playlist_items(url, cookies)
+    if err:
+        sys.exit(explain_failure(err, bool(cookies), site_of(None, url)))
+    if not rows:
+        sys.exit("That link has no list behind it.")
+
+    shown = rows[:PICK_CAP]
+    for number, title, seconds in shown:
+        length = spoken_duration(seconds)
+        if plain:
+            # Tab separated, for the app to parse.
+            say("%d\t%s%s" % (number, title, "\t%s" % length if length else ""))
+        else:
+            say("%3d. %s%s" % (number, title, "  (%s)" % length if length else ""))
+    if not plain:
+        say()
+        say("%d item%s." % (len(rows), "" if len(rows) == 1 else "s"))
+        if len(rows) > len(shown):
+            say("Only the first %d are listed." % len(shown))
+        say("Download some of them with:  ytdl <url> --playlist --items 1,3,5-8")
+
+
 def do_sites(needle):
     """Answer "will this work on X?" without making him try it and find out.
 
@@ -1175,8 +1227,12 @@ def build_command(args, url):
         cmd.append("--yes-playlist")
         # Announce each item as it starts, so a 40-track playlist is a spoken
         # running commentary rather than twenty minutes of silence.
-        cmd += ["--print", "before_dl:%s%%(playlist_index)s/%%(n_entries)s "
-                           "%%(title)s" % ITEM]
+        # autonumber, not playlist_index: with --items 2,4 the index is the
+        # position in the whole list while n_entries is how many you picked,
+        # so the fraction read "4/2". autonumber counts what is actually being
+        # downloaded, which is what a progress line is for.
+        cmd += ["--print", "before_dl:%s%%(playlist_autonumber)s of "
+                           "%%(n_entries)s: %%(title)s" % ITEM]
         # One item failing must not abandon the rest of the list.
         cmd.append("--ignore-errors")
         if args.items:
@@ -1558,6 +1614,10 @@ def main():
                     help="what is downloading now, and what finished recently")
     ap.add_argument("--get", nargs="?", const="", metavar="KEY",
                     help="print settings as key=value, for scripts and the app")
+    ap.add_argument("--list-items", metavar="URL",
+                    help="number every item in a playlist, so you can choose")
+    ap.add_argument("--plain", action="store_true",
+                    help="tab-separated output, for scripts and the app")
     ap.add_argument("--check-url", metavar="URL",
                     help="does yt-dlp recognise this link? prints the site name, "
                          "exits non-zero if not. Offline and instant.")
@@ -1591,6 +1651,10 @@ def main():
         else:
             for key, _ in SETTINGS:
                 say("%s=%s" % (key, values[key]))
+        return
+
+    if args.list_items:
+        do_list_items(args.list_items, args.cookies, args.plain)
         return
 
     if args.check_url:

@@ -191,19 +191,26 @@ on mainScreen()
 		end if
 	end repeat
 
-	if theURL contains "list=" then
+	if theURL contains "list=" and howMany is 1 then
 		try
 			set plAnswer to button returned of (display dialog ¬
 				"That link has a whole playlist attached." & return & return & ¬
-				"The whole playlist goes into its own folder, numbered in order." ¬
+				"Pick the ones I want lets you tick individual episodes." ¬
 				with title appTitle ¬
-				buttons {"Cancel", "Whole playlist", "Just this one"} ¬
-				default button "Just this one" cancel button "Cancel")
+				buttons {"Just this one", "Pick the ones I want", "All of it"} ¬
+				default button "Just this one" cancel button "Just this one")
 		on error number -128
-			set plAnswer to "Cancel"
+			set plAnswer to "Just this one"
 		end try
-		if plAnswer is "Cancel" then return true
-		if plAnswer is "Whole playlist" then set theFlag to theFlag & " --playlist"
+
+		if plAnswer is "All of it" then
+			set theFlag to theFlag & " --playlist"
+
+		else if plAnswer is "Pick the ones I want" then
+			set picked to my pickEpisodes(quoted_urls)
+			if picked is "" then return true
+			set theFlag to theFlag & " --playlist --items " & picked
+		end if
 	end if
 
 	if howMany is 1 then
@@ -242,6 +249,64 @@ on mainScreen()
 	if answer2 is "Check progress" then progressScreen()
 	return true
 end mainScreen
+
+-- Tick the episodes you want. A multi-select list is the right control here:
+-- it is one pass, it reads item by item under VoiceOver, and it beats typing a
+-- range of numbers at something you cannot see. Returns an --items value, or
+-- "" if nothing was chosen.
+on pickEpisodes(quotedURL)
+	try
+		set raw to do shell script shellPrefix & ytdlPath & " --list-items " & ¬
+			quotedURL & " --plain"
+	on error errText
+		my tell_("Could not read that playlist." & return & return & errText)
+		return ""
+	end try
+	if raw is "" then
+		my tell_("That link has no list behind it.")
+		return ""
+	end if
+
+	set AppleScript's text item delimiters to tab
+	set shownList to {}
+	repeat with aLine in paragraphs of raw
+		set aLine to aLine as text
+		if aLine is not "" then
+			set bits to text items of aLine
+			set label_ to (item 1 of bits) & ". " & (item 2 of bits)
+			if (count of bits) > 2 then set label_ to label_ & " (" & (item 3 of bits) & ")"
+			set end of shownList to label_
+		end if
+	end repeat
+	set AppleScript's text item delimiters to ""
+
+	if (count of shownList) is 0 then
+		my tell_("That list came back empty.")
+		return ""
+	end if
+
+	set chosenItems to choose from list shownList with prompt ¬
+		"Tick the ones you want. " & (count of shownList) & " to choose from." ¬
+		with multiple selections allowed ¬
+		OK button name "Download these" cancel button name "Back"
+	if chosenItems is false then return ""
+	if (count of chosenItems) is 0 then return ""
+
+	-- Rebuild the --items value from the leading number of each ticked line.
+	set numbers to ""
+	repeat with anItem in chosenItems
+		set t to anItem as text
+		set AppleScript's text item delimiters to "."
+		set n to first text item of t
+		set AppleScript's text item delimiters to ""
+		if numbers is "" then
+			set numbers to n
+		else
+			set numbers to numbers & "," & n
+		end if
+	end repeat
+	return numbers
+end pickEpisodes
 
 -- Re-checking is a button, never a timer: a dialog that refreshed itself would
 -- talk over VoiceOver mid-sentence.

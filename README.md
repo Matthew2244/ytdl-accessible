@@ -150,9 +150,16 @@ with a dash looks like a flag to the argument parser.)
 
 ```
   --playlist               the whole list, into its own numbered folder
+  --list-items <url>       number every episode, so you can see what to pick
   --items 1-10             or 3,5,7 — just those
   --no-resume              re-fetch items already downloaded
 ```
+
+In the app, a playlist link offers a third choice: **Pick the ones I want**,
+which shows every episode as a tick list. Ticking beats typing a range of
+numbers at something you cannot see, and it reads item by item under VoiceOver.
+`--list-items` is the same thing on the command line — numbers are useless until
+you can see what they refer to.
 
 **Everything else**
 
