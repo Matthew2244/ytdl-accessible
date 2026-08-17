@@ -20,8 +20,6 @@ get one line per event and silence in between.
     --pick                  list the real formats and choose by number
     --list-formats          list them and stop
     --max-height 720        cap video height
-    --set-default wav       remember a format, so you stop typing the flag
-    --settings              show what you have saved
 
   part of a video
     --from 1:30             start there
@@ -33,6 +31,12 @@ get one line per event and silence in between.
     --playlist              the whole list, into its own numbered folder
     --items 1-10            or 3,5,7 — just those
     --no-resume             re-fetch items already downloaded
+
+  settings
+    --setup                 walk through every setting, one at a time
+    --settings              show what is set
+    --set notify=yes        change one setting without the questions
+    --set-default wav       shorthand for --set format=wav
 
   everything else
     --sites bandcamp        is a site supported? (about 1,750 are)
@@ -194,10 +198,240 @@ def do_set_default(value, to):
         return
     say("Saved. From now on:")
     say("  format:      %s" % cfg.get("format", "best (unchanged)"))
-    say("  destination: %s" % cfg.get("to", DEST))
+    say("  destination: %s" % pretty_path(cfg.get("to", DEST)))
     say()
     say("Flags still win for a single run. Settings live in %s"
-        % CONFIG.replace(HOME, "~"))
+        % pretty_path(CONFIG))
+
+
+BOOL_KEYS = ("notify", "progress", "auto_update")
+TRUTHY = ("yes", "true", "on", "1")
+FALSY = ("no", "false", "off", "0")
+
+
+def do_set_pairs(pairs):
+    """Set settings without the questions — what the app drives, and scripts."""
+    cfg = load_config()
+    for pair in pairs:
+        if "=" not in pair:
+            sys.exit("Use KEY=VALUE, for example:  ytdl --set notify=yes")
+        key, _, raw = pair.partition("=")
+        key, raw = key.strip(), raw.strip()
+        known = [k for k, _ in SETTINGS]
+        if key not in known:
+            sys.exit("Not a setting: %s\nThe settings are: %s"
+                     % (key, ", ".join(known)))
+        if key in BOOL_KEYS:
+            if raw.lower() in TRUTHY:
+                cfg[key] = True
+            elif raw.lower() in FALSY:
+                cfg[key] = False
+            else:
+                sys.exit("%s wants yes or no, not %r" % (key, raw))
+        elif key == "format":
+            if raw not in FORMATS:
+                sys.exit("Not a format: %s\nPick one of: %s" % (raw, ", ".join(FORMATS)))
+            cfg[key] = raw
+        elif key == "to":
+            cfg[key] = os.path.abspath(os.path.expanduser(raw))
+        elif key == "max_height":
+            cfg[key] = int(raw) if raw.isdigit() and int(raw) > 0 else None
+        elif key == "cookies":
+            cfg[key] = raw or None
+    if save_config(cfg):
+        show_settings(load_config())
+
+
+def pretty_path(path):
+    """A path as you would say it, not as it is stored."""
+    if not path:
+        return "(unset)"
+    icloud = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs")
+    if path.startswith(icloud):
+        rest = path[len(icloud):].strip("/")
+        return "iCloud Drive / %s" % rest if rest else "iCloud Drive"
+    return path.replace(HOME, "~")
+
+
+def setting(cfg, key, fallback):
+    value = cfg.get(key)
+    return fallback if value is None else value
+
+
+def yes_no(value):
+    return "yes" if value else "no"
+
+
+# The settings, in the order --setup walks through them. Keeping the questions
+# and their defaults in one table means --setup and --settings can never drift
+# apart, which is the usual way a settings screen starts lying.
+SETTINGS = [
+    ("to", "Where downloads go"),
+    ("format", "Default format"),
+    ("notify", "Ping your phone when a download finishes"),
+    ("progress", "Say a percentage while downloading"),
+    ("auto_update", "Keep yt-dlp up to date by itself"),
+    ("cookies", "Use browser sign-in cookies by default"),
+    ("max_height", "Cap video height"),
+]
+
+
+def show_settings(cfg):
+    say("Your settings")
+    say()
+    say("  Downloads go to:      %s" % pretty_path(setting(cfg, "to", DEST)))
+    say("  Default format:       %s" % setting(cfg, "format", "best"))
+    say("  Ping when finished:   %s" % yes_no(setting(cfg, "notify", False)))
+    say("  Say progress:         %s" % yes_no(setting(cfg, "progress", False)))
+    say("  Auto-update yt-dlp:   %s" % yes_no(setting(cfg, "auto_update", True)))
+    cookies = setting(cfg, "cookies", None)
+    say("  Browser cookies:      %s" % (cookies or "no"))
+    cap = setting(cfg, "max_height", None)
+    say("  Cap video height:     %s" % ("%dp" % cap if cap else "no cap"))
+    say()
+    say("Change them with:  ytdl --setup")
+    say("Settings file:     %s" % pretty_path(CONFIG))
+    if not os.path.exists(CONFIG):
+        say()
+        say("(Nothing saved yet — those are the built-in defaults.)")
+
+
+def ask(prompt, options, current_label):
+    """One question, numbered options, Enter keeps what is already set.
+
+    Returns the chosen value, or the sentinel KEEP.
+    """
+    say()
+    say(prompt)
+    say("  Currently: %s" % current_label)
+    for i, (label, _) in enumerate(options, 1):
+        say("  %d. %s" % (i, label))
+    try:
+        answer = input("  Number, or Enter to keep it: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+    if not answer:
+        return KEEP
+    if not answer.isdigit() or not 1 <= int(answer) <= len(options):
+        say("  Not one of the numbers — keeping what you had.")
+        return KEEP
+    return options[int(answer) - 1][1]
+
+
+KEEP = object()
+
+
+def ask_path():
+    try:
+        raw = input("  Full path to the folder: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise KeyboardInterrupt
+    if not raw:
+        return KEEP
+    path = os.path.abspath(os.path.expanduser(raw))
+    parent = os.path.dirname(path)
+    if not os.path.isdir(path) and not os.path.isdir(parent):
+        say("  There is no folder at %s, and its parent does not exist either."
+            % pretty_path(path))
+        say("  Keeping what you had.")
+        return KEEP
+    return path
+
+
+def do_setup():
+    """Walk through every setting, one question at a time."""
+    if not sys.stdin.isatty():
+        sys.exit("ytdl --setup asks questions, so it needs a terminal.\n"
+                 "Use `ytdl --settings` to see what is set, or "
+                 "`ytdl --set-default <format>` to change one thing.")
+
+    cfg = load_config()
+    first = not os.path.exists(CONFIG)
+
+    say("ytdl settings" + (" — first run" if first else ""))
+    say()
+    say("Seven questions. Press Enter on any of them to keep what is already "
+        "set, or Control-C to stop without saving.")
+
+    icloud = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs")
+    try:
+        choice = ask("1 of 7. Where should downloads go?",
+                     [("iCloud Drive, in Media Downloads",
+                       os.path.join(icloud, "Media Downloads")),
+                      ("Your Downloads folder", os.path.join(HOME, "Downloads")),
+                      ("Your Music folder", os.path.join(HOME, "Music")),
+                      ("Somewhere else — type the path", "ASK")],
+                     pretty_path(setting(cfg, "to", DEST)))
+        if choice == "ASK":
+            choice = ask_path()
+        if choice is not KEEP:
+            cfg["to"] = choice
+
+        choice = ask("2 of 7. What format by default?",
+                     [("best — never converts, keeps the source codec", "best"),
+                      ("m4a — plays anywhere, converts non-AAC sources", "m4a"),
+                      ("opus — smallest, converts non-Opus sources", "opus"),
+                      ("mp3 — most compatible, always converts", "mp3"),
+                      ("wav — uncompressed, for a DAW session", "wav"),
+                      ("flac — lossless", "flac"),
+                      ("video — MP4 with picture", "video")],
+                     setting(cfg, "format", "best"))
+        if choice is not KEEP:
+            cfg["format"] = choice
+
+        choice = ask("3 of 7. Ping your phone when a download finishes?",
+                     [("Yes, always", True), ("No — only when I pass --notify", False)],
+                     yes_no(setting(cfg, "notify", False)))
+        if choice is not KEEP:
+            cfg["notify"] = choice
+
+        choice = ask("4 of 7. Say a percentage while downloading?",
+                     [("Yes, every 10 seconds", True),
+                      ("No — just say when it is done", False)],
+                     yes_no(setting(cfg, "progress", False)))
+        if choice is not KEEP:
+            cfg["progress"] = choice
+
+        choice = ask("5 of 7. Keep yt-dlp up to date by itself?",
+                     [("Yes — recommended, sites break it often", True),
+                      ("No, I will run ytdl --update myself", False)],
+                     yes_no(setting(cfg, "auto_update", True)))
+        if choice is not KEEP:
+            cfg["auto_update"] = choice
+
+        cookies = setting(cfg, "cookies", None)
+        choice = ask("6 of 7. Use browser sign-in cookies by default?\n"
+                     "  Only needed for sites that ask you to prove you are "
+                     "not a bot.",
+                     [("No — ask for them with --cookies when needed", ""),
+                      ("Chrome", "chrome"), ("Safari", "safari"),
+                      ("Firefox", "firefox"), ("Edge", "edge")],
+                     cookies or "no")
+        if choice is not KEEP:
+            cfg["cookies"] = choice or None
+
+        cap = setting(cfg, "max_height", None)
+        choice = ask("7 of 7. Cap video height?\n"
+                     "  Smaller files, and it only affects --video.",
+                     [("No cap — best available", 0), ("1080p", 1080),
+                      ("720p", 720), ("480p", 480)],
+                     "%dp" % cap if cap else "no cap")
+        if choice is not KEEP:
+            cfg["max_height"] = choice or None
+
+    except KeyboardInterrupt:
+        say()
+        say()
+        say("Stopped. Nothing was changed.")
+        return
+
+    say()
+    if save_config(cfg):
+        say("Saved.")
+        say()
+        show_settings(load_config())
+        say()
+        say("A flag always beats a saved setting, so none of this locks you in.")
 
 
 # ---------------------------------------------------------------- time ranges
@@ -917,12 +1151,19 @@ def main():
                     help="re-download playlist items already fetched")
 
     ap.add_argument("--info", action="store_true", help="describe it, download nothing")
-    ap.add_argument("--progress", action="store_true", help="a percentage every 10s")
-    ap.add_argument("--no-auto-update", dest="auto_update", action="store_false",
+    ap.add_argument("--progress", dest="progress", action="store_const", const=True,
+                    default=None, help="a percentage every 10s")
+    ap.add_argument("--no-progress", dest="progress", action="store_const",
+                    const=False, help="stay quiet during the download")
+    ap.add_argument("--no-auto-update", dest="auto_update", action="store_const",
+                    const=False, default=None,
                     help="never upgrade yt-dlp on its own")
     ap.add_argument("--cookies", nargs="?", const="chrome", metavar="BROWSER",
                     help="use sign-in cookies from a browser (default chrome)")
-    ap.add_argument("--notify", action="store_true", help="Pushover ping when done")
+    ap.add_argument("--notify", dest="notify", action="store_const", const=True,
+                    default=None, help="Pushover ping when done")
+    ap.add_argument("--no-notify", dest="notify", action="store_const",
+                    const=False, help="no ping, even if saved on")
     ap.add_argument("--quiet", action="store_true", help="print only the final path")
     ap.add_argument("--update", action="store_true", help="brew upgrade yt-dlp")
     ap.add_argument("--set-default", metavar="FORMAT",
@@ -930,6 +1171,10 @@ def main():
     ap.add_argument("--settings", action="store_true", help="show your saved defaults")
     ap.add_argument("--sites", nargs="?", const="", metavar="NAME",
                     help="is a site supported? e.g. --sites bandcamp")
+    ap.add_argument("--setup", action="store_true",
+                    help="walk through every setting, one question at a time")
+    ap.add_argument("--set", dest="set_pairs", action="append", metavar="KEY=VALUE",
+                    help="set one setting without the questions, e.g. --set notify=yes")
     args = ap.parse_args()
 
     if args.update:
@@ -940,6 +1185,14 @@ def main():
         do_sites(args.sites)
         return
 
+    if args.setup:
+        do_setup()
+        return
+
+    if args.set_pairs:
+        do_set_pairs(args.set_pairs)
+        return
+
     cfg = load_config()
 
     if args.set_default or (args.to and args.settings):
@@ -947,12 +1200,7 @@ def main():
         return
 
     if args.settings:
-        say("format:      %s" % cfg.get("format", "best (the built-in default)"))
-        say("destination: %s" % cfg.get("to", DEST))
-        say()
-        say("Change with:  ytdl --set-default wav")
-        say("              ytdl --set-default --to ~/Music")
-        say("Settings file: %s" % CONFIG.replace(HOME, "~"))
+        show_settings(cfg)
         return
 
     # Your saved defaults, with an explicit flag always winning over them.
@@ -962,7 +1210,17 @@ def main():
     if args.kind is None:
         args.kind = cfg.get("format", "best")
     if args.to is None:
-        args.to = cfg.get("to", DEST)
+        args.to = setting(cfg, "to", DEST)
+    if args.notify is None:
+        args.notify = setting(cfg, "notify", False)
+    if args.progress is None:
+        args.progress = setting(cfg, "progress", False)
+    if args.auto_update is None:
+        args.auto_update = setting(cfg, "auto_update", True)
+    if args.cookies is None:
+        args.cookies = setting(cfg, "cookies", None)
+    if args.max_height is None:
+        args.max_height = setting(cfg, "max_height", None)
 
     for label, value in (("--from", args.start), ("--to-time", args.end)):
         if value is not None and parse_time(value) is None:
@@ -1134,6 +1392,15 @@ def main():
     # and the file you asked for.
     if args.auto_update and update_due():
         auto_update()
+
+    # Mentioned once, ever, and only *after* a download has already worked —
+    # a setup prompt standing between someone and their first file is the
+    # fastest way to make a tool feel like homework.
+    if not os.path.exists(CONFIG) and not args.quiet:
+        say()
+        say("First time? `ytdl --setup` sets where downloads go and what "
+            "format you want, so you stop typing flags.")
+        save_config({})
 
 
 if __name__ == "__main__":

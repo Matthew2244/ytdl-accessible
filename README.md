@@ -71,6 +71,23 @@ ytdl <url>                 your default format, into your default folder
 ytdl <url> --info          what you would get, downloads nothing
 ```
 
+**Settings**
+
+```
+ytdl --setup                 walk through every setting, one question at a time
+ytdl --settings              show what is set
+ytdl --set notify=yes        change one setting directly
+```
+
+`--setup` asks seven questions — where downloads go, default format, whether to
+ping your phone, whether to announce progress, auto-update, browser cookies, and a
+video height cap. Enter keeps whatever is already set, Control-C leaves without
+saving. **A flag always beats a saved setting**, so nothing you save locks you in.
+
+The first run mentions `--setup` exactly once, and only *after* a download has
+already worked. A setup prompt standing between someone and their first file is the
+fastest way to make a tool feel like homework.
+
 **Choosing a format**
 
 ```

@@ -1,8 +1,16 @@
 -- Media Download — a launcher for ~/bin/ytdl.
+--
 -- Not YouTube-only: yt-dlp handles about 1,750 sites.
 --
 -- Dialogs rather than a Terminal window: every dialog here is readable by
 -- VoiceOver, and a scrolling terminal is exactly what ytdl exists to avoid.
+--
+-- On personality: the jokes live in the *wording*, never in extra steps. The
+-- welcome appears once and never again, and no dialog exists purely to be
+-- funny — a gag you have to dismiss stops being one the second time. Anyone
+-- listening to this rather than looking at it pays for every word, so the
+-- character has to ride along inside sentences that were going to be said
+-- anyway.
 --
 -- A GUI-launched app gets a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so
 -- Homebrew is invisible to it and yt-dlp would not be found. Hence the
@@ -12,34 +20,82 @@
 property shellPrefix : "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
 property ytdlPath : "$HOME/bin/ytdl"
 property appTitle : "Media Download"
+property welcomeFlag : "$HOME/.config/ytdl/.welcomed"
 
 on run
-	-- Prefill from the clipboard. Copying a link and then launching this is
-	-- the common case, so it should usually be Return, Return and done.
+	greetOnce()
+	repeat
+		if not mainScreen() then exit repeat
+	end repeat
+end run
+
+-- Once. Ever. Then it gets out of the way for good.
+on greetOnce()
+	try
+		do shell script "test -f " & welcomeFlag
+		return
+	end try
+	display dialog "Hello. I fetch things off the internet so you can keep them." & return & return & ¬
+		"Copy a link — YouTube, Bandcamp, SoundCloud, the BBC, about 1,750 sites — then launch me and press Return twice. That is the whole job." & return & return & ¬
+		"I never open what I download and I never play anything at you. I put the file where you asked and get out of the way." & return & return & ¬
+		"You will only see this once." ¬
+		with title "Hello from " & appTitle buttons {"Let's go"} default button "Let's go"
+	do shell script "mkdir -p $HOME/.config/ytdl && touch " & welcomeFlag
+end greetOnce
+
+on pick(theList)
+	return item (random number from 1 to (count of theList)) of theList
+end pick
+
+-- Returns false when the user is done with us.
+on mainScreen()
 	set startURL to ""
 	try
 		set clipText to (the clipboard as text)
-		set trimmed to do shell script "printf %s " & quoted form of clipText & " | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'"
+		set trimmed to do shell script "printf %s " & quoted form of clipText & ¬
+			" | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'"
 		if trimmed starts with "http" then set startURL to trimmed
 	end try
 
-	try
-		set urlReply to display dialog "Paste or edit the link (any site, not just YouTube):" default answer startURL with title appTitle buttons {"Cancel", "Continue"} default button "Continue"
-	on error number -128
-		return
-	end try
-	set theURL to text returned of urlReply
-	if theURL is "" then return
+	set opener to my pick({"What are we grabbing?", "Point me at something.", ¬
+		"Give me a link and I will go and get it.", "What have you got?"})
+	if startURL is not "" then
+		set opener to my pick({"Found a link on your clipboard. Shall I?", ¬
+			"There is a link on your clipboard — Return takes it.", ¬
+			"Clipboard says you want this one."})
+	end if
 
-	set formatNames to {"My default", "Audio - best quality, no conversion", ¬
+	try
+		set reply to display dialog opener default answer startURL with title appTitle ¬
+			buttons {"Quit", "Settings", "Fetch it"} default button "Fetch it"
+	on error number -128
+		return false
+	end try
+
+	set pressed to button returned of reply
+	if pressed is "Quit" then return false
+	if pressed is "Settings" then
+		settingsScreen()
+		return true
+	end if
+
+	set theURL to text returned of reply
+	if theURL is "" then
+		display dialog "That was nothing at all. I need a link." with title appTitle ¬
+			buttons {"Fair enough"} default button "Fair enough"
+		return true
+	end if
+
+	set formatNames to {"My usual", "Best quality, no converting", ¬
 		"M4A - plays anywhere", "Opus - best per kilobyte", ¬
-		"WAV - for a REAPER session", "MP3 320", "FLAC", "Video - MP4"}
-	set chosen to choose from list formatNames with prompt "What do you want?" default items {item 1 of formatNames}
-	if chosen is false then return
+		"WAV - for a REAPER session", "MP3 320", "FLAC - lossless", "Video - MP4"}
+	set chosen to choose from list formatNames with prompt "How would you like it?" ¬
+		default items {item 1 of formatNames}
+	if chosen is false then return true
 	set chosenName to item 1 of chosen
 
 	set theFlag to ""
-	if chosenName starts with "Audio" then set theFlag to " --format best"
+	if chosenName starts with "Best" then set theFlag to " --format best"
 	if chosenName starts with "M4A" then set theFlag to " --format m4a"
 	if chosenName starts with "Opus" then set theFlag to " --format opus"
 	if chosenName starts with "WAV" then set theFlag to " --format wav"
@@ -47,26 +103,27 @@ on run
 	if chosenName starts with "FLAC" then set theFlag to " --format flac"
 	if chosenName starts with "Video" then set theFlag to " --format video"
 
-	-- A link copied from a queue carries the whole playlist with it. Ask
-	-- rather than guess: silently taking two hundred videos would be far
-	-- worse than silently taking one.
+	-- A link copied from a queue carries the whole set with it. Ask rather
+	-- than guess: silently taking two hundred tracks would be far worse than
+	-- silently taking one.
 	if theURL contains "list=" then
 		set plAnswer to button returned of (display dialog ¬
-			"That link is part of a set." with title appTitle ¬
-			buttons {"Cancel", "Just this one", "The whole set"} ¬
-			default button "Just this one")
-		if plAnswer is "Cancel" then return
-		if plAnswer is "The whole set" then set theFlag to theFlag & " --playlist"
+			"Heads up — that link has a whole playlist attached to it." with title appTitle ¬
+			buttons {"Never mind", "Just this one", "All of it"} default button "Just this one")
+		if plAnswer is "Never mind" then return true
+		if plAnswer is "All of it" then set theFlag to theFlag & " --playlist"
 	end if
 
 	-- Check the link before starting anything, so a bad paste or an
 	-- unavailable video fails as a sentence in a dialog rather than as a
 	-- background job that quietly does nothing.
 	try
-		set infoText to do shell script shellPrefix & ytdlPath & " " & quoted form of theURL & theFlag & " --info"
+		set infoText to do shell script shellPrefix & ytdlPath & " " & ¬
+			quoted form of theURL & theFlag & " --info"
 	on error errText
-		display dialog errText with title appTitle buttons {"OK"} default button "OK" with icon stop
-		return
+		display dialog "Hit a wall:" & return & return & errText with title appTitle ¬
+			buttons {"OK"} default button "OK" with icon stop
+		return true
 	end try
 
 	set summary to paragraph 1 of infoText
@@ -76,9 +133,69 @@ on run
 
 	-- Detached on purpose: the app must never sit blocking on a long download
 	-- with no way to report progress. The ytdl-done and ytdl-fail Pushover
-	-- tones are the completion signal, which is why --notify is not optional
-	-- here even though it is on the command line.
-	do shell script shellPrefix & "nohup " & ytdlPath & " " & quoted form of theURL & theFlag & " --notify > $HOME/.ytdl-app.log 2>&1 &"
+	-- tones are the completion signal, which is why --notify is not optional.
+	do shell script shellPrefix & "nohup " & ytdlPath & " " & quoted form of theURL & ¬
+		theFlag & " --notify > $HOME/.ytdl-app.log 2>&1 &"
 
-	display dialog "Downloading:" & return & return & summary & return & return & "It will ping you when it is done." with title appTitle buttons {"OK"} default button "OK"
-end run
+	set sendoff to my pick({"Off I go.", "On it.", "Consider it done.", ¬
+		"Right, fetching.", "Say no more."})
+	display dialog sendoff & return & return & summary & return & return & ¬
+		"You will hear the finished tone when it lands." with title appTitle ¬
+		buttons {"Grab another", "Done"} default button "Grab another"
+	if button returned of result is "Done" then return false
+	return true
+end mainScreen
+
+on settingsScreen()
+	repeat
+		set opts to {"Where downloads go", "Default format", ¬
+			"Ping my phone when finished", "Say progress while downloading", ¬
+			"Show me everything", "Back"}
+		set choice to choose from list opts with prompt ¬
+			"Settings — what would you like to change?" default items {item 1 of opts}
+		if choice is false then return
+		set what to item 1 of choice
+		if what is "Back" then return
+
+		if what is "Show me everything" then
+			set current to do shell script shellPrefix & ytdlPath & " --settings"
+			display dialog current with title appTitle buttons {"OK"} default button "OK"
+
+		else if what is "Where downloads go" then
+			try
+				set theFolder to choose folder with prompt "Where should downloads land?"
+				do shell script shellPrefix & ytdlPath & " --set to=" & ¬
+					quoted form of (POSIX path of theFolder)
+				display dialog "Right, they go there now." with title appTitle ¬
+					buttons {"Good"} default button "Good"
+			on error number -128
+			end try
+
+		else if what is "Default format" then
+			set fmts to {"best", "m4a", "opus", "mp3", "wav", "flac", "video"}
+			set f to choose from list fmts with prompt ¬
+				"Default format. 'best' never converts anything." default items {"best"}
+			if f is not false then
+				do shell script shellPrefix & ytdlPath & " --set format=" & (item 1 of f)
+				display dialog "Default is now " & (item 1 of f) & "." with title appTitle ¬
+					buttons {"Good"} default button "Good"
+			end if
+
+		else if what is "Ping my phone when finished" then
+			set a to button returned of (display dialog ¬
+				"Send a Pushover notification when a download finishes?" with title appTitle ¬
+				buttons {"Cancel", "No", "Yes"} default button "Yes")
+			if a is not "Cancel" then
+				do shell script shellPrefix & ytdlPath & " --set notify=" & a
+			end if
+
+		else if what is "Say progress while downloading" then
+			set a to button returned of (display dialog ¬
+				"Announce a percentage every ten seconds during a download?" with title appTitle ¬
+				buttons {"Cancel", "No", "Yes"} default button "No")
+			if a is not "Cancel" then
+				do shell script shellPrefix & ytdlPath & " --set progress=" & a
+			end if
+		end if
+	end repeat
+end settingsScreen
