@@ -190,6 +190,23 @@ app owns the format on your Mac is never launched. If double-clicking a download
 something you don't want, that is macOS file association, not this tool — and
 `--set-default` lets you pick a format whose association you're happy with.
 
+## Working on it
+
+```bash
+./check.sh
+```
+
+Compiles the AppleScript, parses the Python, confirms every command-line option
+has help text, and checks two things about the dialogs that are easy to get
+wrong and invisible once wrong: that no dialog has the same button set as both
+default and cancel (which silently kills Escape), and that every list offers a
+Back item. Exits non-zero if anything fails.
+
+It exists because a broken AppleScript once got committed and pushed: the
+compile failed, the error scrolled past, and the app was left missing from
+Applications. Anything checkable should be checked by something that does not
+get tired.
+
 ## Design notes
 
 The parts that are less obvious than they look.

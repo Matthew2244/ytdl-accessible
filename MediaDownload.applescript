@@ -43,10 +43,12 @@ on run
 	repeat
 		try
 			if not mainScreen() then exit repeat
-		on error number -128
-			-- Escape that got past a closer handler. Never closes the app.
 		on error errText number errNum
-			if errNum is -1712 then
+			-- One `on error` per try — AppleScript allows no more — so the
+			-- cases are sorted here rather than in separate clauses.
+			if errNum is -128 then
+				-- Escape that got past a closer handler. Never closes the app.
+			else if errNum is -1712 then
 				my tell_("That took too long and was given up on." & return & return & ¬
 					"Nothing was damaged. If it was an update, try again — " & ¬
 					"Homebrew is sometimes slow the first time.")
@@ -230,7 +232,7 @@ on mainScreen()
 				"Pick the ones I want lets you tick individual episodes." ¬
 				with title appTitle ¬
 				buttons {"Just this one", "Pick the ones I want", "All of it"} ¬
-				default button "Just this one" cancel button "Just this one")
+				default button "Just this one")
 		on error number -128
 			set plAnswer to "Just this one"
 		end try
