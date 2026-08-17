@@ -26,8 +26,14 @@
 -- one, `display dialog` runs a modal session that blocks the menus while it is
 -- up, which here is always. What does work is Escape (and Command-period), but
 -- only on a dialog that declares a `cancel button`. So every dialog below
--- declares one, and every dialog names it in its text. On the main screens
--- Escape quits; everywhere else it goes back.
+-- declares one, and every dialog names it in its text.
+--
+-- Escape never closes the app. It means "back" or "dismiss" everywhere, and on
+-- the main link box it deliberately does nothing at all, because there is
+-- nothing behind it to go back to — and the only way to make Escape inert on a
+-- dialog is to give it no cancel button. Quit is a button press only. Escape
+-- is easy to hit by accident, and losing the screen you were on is a poor
+-- reward for it.
 --
 -- A GUI-launched app gets a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so
 -- Homebrew is invisible to it and yt-dlp would not be found. Hence the
@@ -45,8 +51,8 @@ on run
 		try
 			if not mainScreen() then exit repeat
 		on error number -128
-			-- Escape anywhere that was not caught closer in. Never a crash.
-			exit repeat
+			-- Escape anywhere that was not caught closer in. It must never
+			-- close the app, so this loops back to the link box.
 		end try
 	end repeat
 end run
@@ -120,13 +126,13 @@ on mainScreen()
 				"There is a " & siteName & " link on your clipboard:" & return & return & shown & ¬
 			return & return & ¬
 			"Yes, fetch it — download this one." & return & ¬
-			"No, something else — go to the link box, empty." & return & ¬
-			"Quit — close the app. Escape does the same." ¬
+			"No, something else — go to the link box, empty. Escape does the same." & return & ¬
+			"Quit — close the app." ¬
 			with title appTitle ¬
 			buttons {"Quit", "No, something else", "Yes, fetch it"} ¬
-				default button "Yes, fetch it" cancel button "Quit")
+				default button "Yes, fetch it" cancel button "No, something else")
 		on error number -128
-			return false
+			set ans to "No, something else"
 		end try
 		if ans is "Quit" then return false
 		if ans is "No, something else" then set startURL to ""
@@ -141,12 +147,14 @@ on mainScreen()
 			"Type or paste a link. Several at once? Separate them with spaces." & return & return & ¬
 			"Fetch it — choose a format, then download." & return & ¬
 			"More — settings, progress, supported sites, and help." & return & ¬
-			"Quit — close the app. Escape does the same." ¬
+			"Quit — close the app. Escape does nothing here, on purpose." ¬
 			default answer startURL with title appTitle ¬
-			buttons {"Quit", "More", "Fetch it"} default button "Fetch it" ¬
-			cancel button "Quit"
+			buttons {"Quit", "More", "Fetch it"} default button "Fetch it"
 	on error number -128
-		return false
+		-- Unreachable while this dialog has no cancel button, but if one is
+		-- ever added back, a cancel here must return to the link box rather
+		-- than close the app.
+		return true
 	end try
 
 	set pressed to button returned of reply
@@ -253,11 +261,12 @@ on mainScreen()
 		return & return & "You will hear the finished tone when it lands." & return & return & ¬
 		"Grab another — back to the link box." & return & ¬
 		"How is it going? — check on the download." & return & ¬
-		"Done — close the app. The download keeps going. Escape does the same." ¬
+		"Grab another — Escape does the same." & return & ¬
+		"Done — close the app. The download keeps going." ¬
 		with title appTitle buttons {"Done", "How is it going?", "Grab another"} ¬
-			default button "Grab another" cancel button "Done")
+			default button "Grab another" cancel button "Grab another")
 	on error number -128
-		return false
+		set answer2 to "Grab another"
 	end try
 	if answer2 is "Done" then return false
 	if answer2 is "How is it going?" then progressScreen()
