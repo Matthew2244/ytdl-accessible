@@ -30,15 +30,33 @@ on run
 	set theURL to text returned of urlReply
 	if theURL is "" then return
 
-	set formatNames to {"Audio - best quality, no conversion", "WAV - for a REAPER session", "Video - MP4", "MP3 320"}
+	set formatNames to {"My default", "Audio - best quality, no conversion", ¬
+		"M4A - plays anywhere", "Opus - best per kilobyte", ¬
+		"WAV - for a REAPER session", "MP3 320", "FLAC", "Video - MP4"}
 	set chosen to choose from list formatNames with prompt "What do you want?" default items {item 1 of formatNames}
 	if chosen is false then return
 	set chosenName to item 1 of chosen
 
 	set theFlag to ""
-	if chosenName starts with "WAV" then set theFlag to " --wav"
-	if chosenName starts with "Video" then set theFlag to " --video"
-	if chosenName starts with "MP3" then set theFlag to " --mp3"
+	if chosenName starts with "Audio" then set theFlag to " --format best"
+	if chosenName starts with "M4A" then set theFlag to " --format m4a"
+	if chosenName starts with "Opus" then set theFlag to " --format opus"
+	if chosenName starts with "WAV" then set theFlag to " --format wav"
+	if chosenName starts with "MP3" then set theFlag to " --format mp3"
+	if chosenName starts with "FLAC" then set theFlag to " --format flac"
+	if chosenName starts with "Video" then set theFlag to " --format video"
+
+	-- A link copied from a queue carries the whole playlist with it. Ask
+	-- rather than guess: silently taking two hundred videos would be far
+	-- worse than silently taking one.
+	if theURL contains "list=" then
+		set plAnswer to button returned of (display dialog ¬
+			"That link is part of a playlist." with title appTitle ¬
+			buttons {"Cancel", "Just this video", "Whole playlist"} ¬
+			default button "Just this video")
+		if plAnswer is "Cancel" then return
+		if plAnswer is "Whole playlist" then set theFlag to theFlag & " --playlist"
+	end if
 
 	-- Check the link before starting anything, so a bad paste or an
 	-- unavailable video fails as a sentence in a dialog rather than as a

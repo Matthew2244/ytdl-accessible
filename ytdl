@@ -6,22 +6,46 @@ bar rewrites one terminal line many times a second, so a screen reader spends
 the whole download interrupting itself and never finishes a sentence. Here you
 get one line per event and silence in between.
 
-    ytdl <url>              best audio, original codec, into iCloud
+    ytdl <url>              your default format, into your default folder
     ytdl                    take the URL from the clipboard
-    ytdl <url> --info       title, length, formats — download nothing
+    ytdl <url> --info       title, length, what you would get — no download
 
-    --video                 best video and audio, merged to MP4
-    --mp3                   transcode to MP3 320 (costs a lossy generation)
-    --wav                   decode to WAV, ready for a REAPER session
-    --to PATH               somewhere other than the iCloud folder
+  choosing a format
+    --format KIND           best, m4a, opus, mp3, wav, flac or video
+    --video --mp3 --wav     shorthand for the same
+    --pick                  list the real formats and choose by number
+    --list-formats          list them and stop
+    --max-height 720        cap video height
+    --set-default wav       remember a format, so you stop typing the flag
+    --settings              show what you have saved
+
+  part of a video
+    --from 1:30             start there
+    --to-time 3:45          stop there
+    --chapters              also split into one file per chapter
+    --subtitles             also fetch English subtitles as .srt
+
+  playlists
+    --playlist              the whole list, into its own numbered folder
+    --items 1-10            or 3,5,7 — just those
+    --no-resume             re-fetch items already downloaded
+
+  everything else
+    --to PATH               a different folder, just this once
     --name "..."            set the filename yourself
-    --playlist              opt in to the whole playlist
     --progress              a percentage line every 10 seconds, no faster
     --cookies [BROWSER]     sign-in cookies, for "confirm you're not a bot"
-    --notify                Pushover ping when it finishes
+    --notify                Pushover ping on finish and on failure
     --quiet                 print the final path and nothing else
     --update                brew upgrade yt-dlp now, and say what changed
     --no-auto-update        never upgrade yt-dlp on its own
+
+Nothing here ever opens a file. Downloads are written and left alone, so
+whatever app owns the format on your Mac is never launched.
+
+A playlist goes into its own folder, numbered in playlist order, and keeps a
+small archive file beside the files so re-running it resumes rather than
+starting over. One bad item does not abandon the rest of the list.
 
 yt-dlp keeps itself current without being asked. It upgrades when a download
 fails and a newer release exists — the moment it actually matters — and again
@@ -43,6 +67,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -71,7 +96,19 @@ SOUND_DONE = "ytdl-done"
 SOUND_FAIL = "ytdl-fail"
 
 MARK = "YTDLFILE:"
+ITEM = "YTDLITEM:"
 PROGRESS_EVERY = 10.0  # seconds — a rate a screen reader can finish speaking
+
+# Your own defaults, so the format you want is the format you get without
+# typing a flag every time. `ytdl --set-default wav` writes this.
+CONFIG = os.path.join(HOME, ".config", "ytdl", "config.json")
+
+# One archive per playlist folder, so re-running a playlist resumes instead of
+# re-downloading. Kept beside the files it describes, not in a global store —
+# delete the folder and the bookkeeping goes with it.
+ARCHIVE_NAME = ".ytdl-archive.txt"
+
+FORMATS = ("best", "m4a", "opus", "mp3", "wav", "flac", "video")
 
 
 # ---------------------------------------------------------------- speaking
@@ -113,6 +150,69 @@ def spoken_size(num_bytes):
             value = num_bytes / cutoff
             return "%.1f %s" % (value, unit) if value < 10 else "%d %s" % (round(value), unit)
     return "%d bytes" % int(num_bytes)
+
+
+# ---------------------------------------------------------------- your defaults
+
+def load_config():
+    try:
+        with open(CONFIG) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "w") as fh:
+            json.dump(cfg, fh, indent=2)
+        return True
+    except OSError as exc:
+        say("Could not save your settings: %s" % exc)
+        return False
+
+
+def do_set_default(value, to):
+    cfg = load_config()
+    if value:
+        if value not in FORMATS:
+            sys.exit("Not a format I know: %s\nPick one of: %s"
+                     % (value, ", ".join(FORMATS)))
+        cfg["format"] = value
+    if to:
+        cfg["to"] = os.path.abspath(os.path.expanduser(to))
+    if not save_config(cfg):
+        return
+    say("Saved. From now on:")
+    say("  format:      %s" % cfg.get("format", "best (unchanged)"))
+    say("  destination: %s" % cfg.get("to", DEST))
+    say()
+    say("Flags still win for a single run. Settings live in %s"
+        % CONFIG.replace(HOME, "~"))
+
+
+# ---------------------------------------------------------------- time ranges
+
+def parse_time(text):
+    """Accept 90, 1:30 or 1:02:03 and return seconds. None if unparseable."""
+    if text is None:
+        return None
+    text = str(text).strip()
+    if not re.match(r"^\d+(:\d{1,2}){0,2}$", text):
+        return None
+    parts = [int(p) for p in text.split(":")]
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return seconds
+
+
+def clock(seconds):
+    """Seconds back to h:mm:ss, for handing to yt-dlp."""
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return "%d:%02d:%02d" % (hours, minutes, secs)
 
 
 # ---------------------------------------------------------------- yt-dlp
@@ -204,19 +304,129 @@ def playlist_size(url):
 
 
 def selector(args):
-    """The format selector, shared by --info and the download itself.
+    """The format selector, shared by --info, --pick and the download itself.
 
-    Both paths use this so --info can never describe a different stream from
+    Every path uses this so --info can never describe a different stream from
     the one that would actually arrive.
     """
-    if args.video:
+    if getattr(args, "format_id", None):
+        return ["-f", args.format_id]
+    if args.kind == "video":
+        cap = getattr(args, "max_height", None)
+        if cap:
+            return ["-f", "bv*[height<=%d][ext=mp4]+ba[ext=m4a]/"
+                          "bv*[height<=%d]+ba/b[height<=%d]/b" % (cap, cap, cap)]
         return ["-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b"]
+    if args.kind == "m4a":
+        # Prefer the AAC stream so no transcode is needed to land as .m4a.
+        return ["-f", "bestaudio[ext=m4a]/bestaudio"]
+    if args.kind == "opus":
+        return ["-f", "bestaudio[acodec=opus]/bestaudio"]
     return ["-f", "bestaudio"]
 
 
-def fetch_info(url, cookies, fmt=None):
-    cmd = [yt_dlp_path(), "-J", "--no-playlist", "--no-warnings"]
-    cmd += fmt or []
+def describe_format(fmt):
+    """One plain sentence for a format, the way you would say it out loud."""
+    acodec, vcodec = fmt.get("acodec"), fmt.get("vcodec")
+    has_audio = acodec and acodec != "none"
+    has_video = vcodec and vcodec != "none"
+    size = spoken_size(fmt.get("filesize") or fmt.get("filesize_approx"))
+
+    if has_video and has_audio:
+        what = "Video %sp with sound, %s" % (fmt.get("height") or "?", vcodec)
+    elif has_video:
+        what = "Video %sp, %s (sound merged in separately)" % (
+            fmt.get("height") or "?", vcodec)
+    else:
+        abr = fmt.get("abr")
+        what = "Audio, %s%s" % (acodec, ", %d kbps" % round(abr) if abr else "")
+    return "%s%s" % (what, ", about %s" % size if size else "")
+
+
+def choosable(info):
+    """Formats worth offering: best audio per codec, and one per resolution.
+
+    yt-dlp reports upwards of forty formats for a normal video. Reading forty
+    near-identical lines aloud is useless, so this collapses them to the ones
+    that represent a real choice.
+    """
+    best_audio, best_video = {}, {}
+    for fmt in info.get("formats") or []:
+        acodec, vcodec = fmt.get("acodec"), fmt.get("vcodec")
+        if fmt.get("format_note") == "storyboard" or fmt.get("ext") == "mhtml":
+            continue
+        if vcodec and vcodec != "none":
+            key = fmt.get("height") or 0
+            if key and (key not in best_video or
+                        (fmt.get("tbr") or 0) > (best_video[key].get("tbr") or 0)):
+                best_video[key] = fmt
+        elif acodec and acodec != "none":
+            key = acodec.split(".")[0]
+            if key not in best_audio or (fmt.get("abr") or 0) > (best_audio[key].get("abr") or 0):
+                best_audio[key] = fmt
+
+    audio = sorted(best_audio.values(), key=lambda f: -(f.get("abr") or 0))
+    video = sorted(best_video.values(), key=lambda f: -(f.get("height") or 0))
+    return audio + video
+
+
+def do_list_formats(info, interactive):
+    """List the real choices. Returns a chosen format id, or None."""
+    options = choosable(info)
+    if not options:
+        say("yt-dlp reported no usable formats for that one.")
+        return None
+
+    say("%d choice%s:" % (len(options), "" if len(options) == 1 else "s"))
+    say()
+    for i, fmt in enumerate(options, 1):
+        say("%2d. %s" % (i, describe_format(fmt)))
+    say()
+
+    if not interactive:
+        say("Download one with:  ytdl <url> --format-id <id>")
+        say("Ids, in the same order: %s"
+            % ", ".join(str(f.get("format_id")) for f in options))
+        return None
+
+    if not sys.stdin.isatty():
+        say("--pick needs a terminal to ask you in. Use --list-formats instead.")
+        return None
+
+    try:
+        answer = input("Number to download (Enter to cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        say()
+        return None
+    if not answer:
+        return None
+    if not answer.isdigit() or not 1 <= int(answer) <= len(options):
+        say("Pick a number from 1 to %d." % len(options))
+        return None
+
+    chosen = options[int(answer) - 1]
+    say("Chose: %s" % describe_format(chosen))
+    # A video-only stream needs audio merged in, or you get a silent file.
+    vcodec = chosen.get("vcodec")
+    if vcodec and vcodec != "none" and (chosen.get("acodec") in (None, "none")):
+        return "%s+bestaudio/%s" % (chosen.get("format_id"), chosen.get("format_id"))
+    return str(chosen.get("format_id"))
+
+
+def fetch_info(url, cookies, fmt=None, flat=False):
+    """Metadata for one video, or a flat listing for a playlist.
+
+    `flat` matters more than it looks. Without it, -J on a playlist extracts
+    every entry in full — for a channel's uploads that is hundreds of round
+    trips and it simply times out. --flat-playlist returns the list and its
+    titles in one request and leaves per-video extraction to the download.
+    """
+    cmd = [yt_dlp_path(), "-J", "--no-warnings"]
+    if flat:
+        cmd += ["--yes-playlist", "--flat-playlist"]
+    else:
+        cmd.append("--no-playlist")
+        cmd += fmt or []
     if cookies:
         cmd += ["--cookies-from-browser", cookies]
     cmd.append(url)
@@ -400,6 +610,13 @@ def describe(info):
     """The two lines said before every download: what it is, and how big."""
     title = info.get("title") or "Untitled"
     uploader = info.get("uploader") or info.get("channel")
+
+    if info.get("_type") == "playlist" or info.get("entries") is not None:
+        count = info.get("playlist_count") or len(info.get("entries") or [])
+        say("Playlist: %s%s" % (title, " — %s" % uploader if uploader else ""))
+        say("%d video%s." % (count, "" if count == 1 else "s"))
+        return title
+
     say("%s%s" % (title, " — %s" % uploader if uploader else ""))
 
     bits = []
@@ -447,24 +664,71 @@ def build_command(args, url):
     if args.name:
         cmd += ["-o", "%s.%%(ext)s" % args.name]
     elif args.playlist:
-        cmd += ["-o", "%(playlist_title)s/%(playlist_index)02d - %(title)s.%(ext)s"]
+        # Its own folder, numbered in playlist order, so the set stays together
+        # and sorts correctly by name.
+        cmd += ["-o", "%(playlist_title)s/%(playlist_index)03d - %(title)s.%(ext)s"]
     else:
         cmd += ["-o", "%(title)s.%(ext)s"]
 
-    cmd.append("--yes-playlist" if args.playlist else "--no-playlist")
+    if args.playlist:
+        cmd.append("--yes-playlist")
+        # Announce each item as it starts, so a 40-track playlist is a spoken
+        # running commentary rather than twenty minutes of silence.
+        cmd += ["--print", "before_dl:%s%%(playlist_index)s/%%(n_entries)s "
+                           "%%(title)s" % ITEM]
+        # One item failing must not abandon the rest of the list.
+        cmd.append("--ignore-errors")
+        if args.items:
+            cmd += ["--playlist-items", args.items]
+        if args.resume:
+            cmd += ["--download-archive",
+                    os.path.join(args.to, ARCHIVE_NAME)]
+    else:
+        cmd.append("--no-playlist")
 
-    if args.video:
-        # Prefer streams that merge by stream copy rather than re-encode.
-        cmd += ["-f", "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b",
-                "--merge-output-format", "mp4"]
-    elif args.mp3:
+    cmd += selector(args)
+
+    # An exact stream, asked for by id or chosen from --pick, is taken as it
+    # comes. Applying a saved default format here would re-encode the very
+    # stream you went to the trouble of naming — which is how --format-id 251
+    # (Opus) once landed as a fatter, lossier .m4a.
+    if args.format_id and not args.explicit_kind:
+        if getattr(args, "format_audio_only", False):
+            # Container swap only — "best" keeps the source codec, so this
+            # turns raw .webm into .opus without touching the audio.
+            cmd += ["-x", "--audio-format", "best", "--embed-metadata"]
+        else:
+            cmd += ["--merge-output-format", "mp4", "--embed-metadata"]
+    elif args.kind == "video":
+        cmd += ["--merge-output-format", "mp4"]
+    elif args.kind == "mp3":
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "320K",
                 "--embed-metadata"]
-    elif args.wav:
+    elif args.kind == "wav":
         cmd += ["-x", "--audio-format", "wav"]
-    else:
-        # "best" here means keep the source codec — container change only.
+    elif args.kind == "flac":
+        cmd += ["-x", "--audio-format", "flac", "--embed-metadata"]
+    elif args.kind in ("m4a", "opus"):
+        cmd += ["-x", "--audio-format", args.kind, "--embed-metadata"]
+    elif not args.format_id:
+        # "best" means keep the source codec — container change only.
         cmd += ["-x", "--audio-format", "best", "--embed-metadata"]
+
+    # A time range. --force-keyframes-at-cuts costs a re-encode of the cut
+    # itself but makes the start land where you asked rather than at the
+    # nearest keyframe, which can be seconds early.
+    start, end = parse_time(args.start), parse_time(args.end)
+    if start is not None or end is not None:
+        cmd += ["--download-sections",
+                "*%s-%s" % (clock(start or 0), clock(end) if end is not None else "inf"),
+                "--force-keyframes-at-cuts"]
+
+    if args.chapters:
+        cmd.append("--split-chapters")
+
+    if args.subtitles:
+        cmd += ["--write-auto-subs", "--write-subs", "--sub-langs", "en.*",
+                "--convert-subs", "srt"]
 
     if args.cookies:
         cmd += ["--cookies-from-browser", args.cookies]
@@ -498,6 +762,12 @@ def run_download(cmd, args):
             if line.startswith(MARK):
                 files.append(line[len(MARK):])
                 continue
+            if line.startswith(ITEM):
+                # Reset the progress clock per item, so the first percentage
+                # of a new track is not swallowed by the previous one's.
+                last_spoken = 0.0
+                say(line[len(ITEM):])
+                continue
             tail.append(line)
             del tail[:-40]
             if line.startswith("PROGRESS "):
@@ -527,12 +797,43 @@ def main():
     ap = argparse.ArgumentParser(add_help=True, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("url", nargs="?", help="the link (default: the clipboard)")
-    ap.add_argument("--to", default=DEST, help="destination folder")
+    ap.add_argument("--to", help="destination folder")
     ap.add_argument("--name", help="filename, without extension")
-    ap.add_argument("--video", action="store_true", help="video and audio, merged to MP4")
-    ap.add_argument("--mp3", action="store_true", help="transcode to MP3 320")
-    ap.add_argument("--wav", action="store_true", help="decode to WAV")
-    ap.add_argument("--playlist", action="store_true", help="take the whole playlist")
+
+    fmt = ap.add_argument_group("what to download")
+    fmt.add_argument("--format", dest="kind", choices=FORMATS,
+                     help="best, m4a, opus, mp3, wav, flac or video")
+    fmt.add_argument("--video", dest="kind", action="store_const", const="video",
+                     help="same as --format video")
+    fmt.add_argument("--mp3", dest="kind", action="store_const", const="mp3",
+                     help="same as --format mp3")
+    fmt.add_argument("--wav", dest="kind", action="store_const", const="wav",
+                     help="same as --format wav")
+    fmt.add_argument("--max-height", type=int, metavar="N",
+                     help="cap video height, e.g. 720")
+    fmt.add_argument("--pick", action="store_true",
+                     help="list the real formats and choose one by number")
+    fmt.add_argument("--list-formats", action="store_true",
+                     help="list the real formats, download nothing")
+    fmt.add_argument("--format-id", help="an exact yt-dlp format id")
+
+    part = ap.add_argument_group("part of a video")
+    part.add_argument("--from", dest="start", metavar="TIME",
+                      help="start at 1:30, 90 or 1:02:03")
+    part.add_argument("--to-time", dest="end", metavar="TIME", help="stop at")
+    part.add_argument("--chapters", action="store_true",
+                      help="also split into one file per chapter")
+    part.add_argument("--subtitles", action="store_true",
+                      help="also fetch English subtitles as .srt")
+
+    pl = ap.add_argument_group("playlists")
+    pl.add_argument("--playlist", action="store_true",
+                    help="take the whole playlist, into its own folder")
+    pl.add_argument("--items", metavar="RANGE",
+                    help="which ones: 1-10, or 3,5,7")
+    pl.add_argument("--no-resume", dest="resume", action="store_false",
+                    help="re-download playlist items already fetched")
+
     ap.add_argument("--info", action="store_true", help="describe it, download nothing")
     ap.add_argument("--progress", action="store_true", help="a percentage every 10s")
     ap.add_argument("--no-auto-update", dest="auto_update", action="store_false",
@@ -542,14 +843,46 @@ def main():
     ap.add_argument("--notify", action="store_true", help="Pushover ping when done")
     ap.add_argument("--quiet", action="store_true", help="print only the final path")
     ap.add_argument("--update", action="store_true", help="brew upgrade yt-dlp")
+    ap.add_argument("--set-default", metavar="FORMAT",
+                    help="remember a format as your default (with --to, a folder)")
+    ap.add_argument("--settings", action="store_true", help="show your saved defaults")
     args = ap.parse_args()
 
     if args.update:
         do_update()
         return
 
-    if sum([args.video, args.mp3, args.wav]) > 1:
-        sys.exit("Pick one of --video, --mp3 or --wav, not several.")
+    cfg = load_config()
+
+    if args.set_default or (args.to and args.settings):
+        do_set_default(args.set_default, args.to)
+        return
+
+    if args.settings:
+        say("format:      %s" % cfg.get("format", "best (the built-in default)"))
+        say("destination: %s" % cfg.get("to", DEST))
+        say()
+        say("Change with:  ytdl --set-default wav")
+        say("              ytdl --set-default --to ~/Music")
+        say("Settings file: %s" % CONFIG.replace(HOME, "~"))
+        return
+
+    # Your saved defaults, with an explicit flag always winning over them.
+    # Remember which it was: a saved default must not silently transcode a
+    # stream you asked for by id.
+    args.explicit_kind = args.kind is not None
+    if args.kind is None:
+        args.kind = cfg.get("format", "best")
+    if args.to is None:
+        args.to = cfg.get("to", DEST)
+
+    for label, value in (("--from", args.start), ("--to-time", args.end)):
+        if value is not None and parse_time(value) is None:
+            sys.exit("%s does not look like a time: %s\n"
+                     "Use 90, 1:30 or 1:02:03." % (label, value))
+    if (parse_time(args.start) is not None and parse_time(args.end) is not None
+            and parse_time(args.end) <= parse_time(args.start)):
+        sys.exit("--to-time has to come after --from.")
 
     url = check_url(args.url or url_from_clipboard())
     args.to = os.path.abspath(os.path.expanduser(args.to))
@@ -557,7 +890,7 @@ def main():
     if not args.url and not args.quiet:
         say("Using the URL on the clipboard.")
 
-    info, error = fetch_info(url, args.cookies, selector(args))
+    info, error = fetch_info(url, args.cookies, selector(args), flat=args.playlist)
     if info is None:
         # Private, unavailable, or a bot check — this is the *common* failure,
         # and it lands before the download, so it needs the ping just as much.
@@ -569,14 +902,51 @@ def main():
         do_info(info)
         return
 
-    if not args.quiet:
+    if (args.pick or args.list_formats) and args.playlist:
+        # A flat playlist listing carries no per-video formats, and the videos
+        # in one list rarely offer the same set anyway.
+        sys.exit("--pick and --list-formats work on a single video, not a "
+                 "playlist.\nUse --format or --max-height for a whole list.")
+
+    if args.pick or args.list_formats:
         describe(info)
+        say()
+        chosen = do_list_formats(info, interactive=args.pick)
+        if not chosen:
+            return
+        args.format_id = chosen
+        say()
+
+    # Is the named stream audio-only? Decides whether it gets remuxed to an
+    # audio container or merged as video. "id+bestaudio" from --pick is always
+    # a video pairing.
+    args.format_audio_only = False
+    if args.format_id and "+" not in args.format_id:
+        for fmt in info.get("formats") or []:
+            if str(fmt.get("format_id")) == str(args.format_id):
+                vcodec = fmt.get("vcodec")
+                args.format_audio_only = not (vcodec and vcodec != "none")
+                break
+
+    if not args.quiet:
+        if not (args.pick or args.list_formats):
+            describe(info)
         if in_a_playlist(url) and not args.playlist:
             count = playlist_size(url)
             say("That link is part of a playlist%s — taking just this one." %
                 (" of %d videos" % count if count else ""))
             say("Add --playlist for the whole list.")
-        say("Downloading...")
+        start, end = parse_time(args.start), parse_time(args.end)
+        if start is not None or end is not None:
+            say("Just the section from %s to %s."
+                % (spoken_duration(start) or "the start",
+                   spoken_duration(end) or "the end"))
+        if args.playlist:
+            say("Downloading the playlist%s%s..."
+                % (" (items %s)" % args.items if args.items else "",
+                   ", skipping any already fetched" if args.resume else ""))
+        else:
+            say("Downloading...")
 
     os.makedirs(args.to, exist_ok=True)
     os.makedirs(SCRATCH, exist_ok=True)
@@ -586,24 +956,34 @@ def main():
     if code == 130:
         return
 
+    partial = False
     if code != 0:
-        # A failure is the moment a newer yt-dlp is actually worth having, so
-        # this is where the auto-update earns its keep — not on a timer. It
-        # only fires for failures an upgrade could plausibly fix, and only
-        # retries when the version genuinely moved.
         text = "\n".join(tail)
-        if args.auto_update and worth_updating_for(text):
-            if auto_update("That failed. "):
-                say("Trying again...")
-                code, files, tail = run_download(build_command(args, url), args)
-                text = "\n".join(tail)
-        if code != 0:
-            # Silence is the worst outcome for a download started from the
-            # phone, so the failure pings too — at priority 1, unlike a finish.
-            if args.notify:
-                notify("Download failed: %s" % (info.get("title") or url)[:120],
-                       SOUND_FAIL)
-            sys.exit(explain_failure(text, bool(args.cookies)))
+
+        # A playlist that got part of the way is a partial success, not a
+        # failure. --ignore-errors keeps yt-dlp going past a bad item and it
+        # still exits non-zero, so treating that as total failure would throw
+        # away news of every file that *did* arrive — and re-running would be
+        # the only way to find out. Report both instead.
+        if args.playlist and files:
+            partial = True
+        else:
+            # Otherwise a failure is the moment a newer yt-dlp is actually
+            # worth having, so this is where the auto-update earns its keep —
+            # not on a timer. It only fires for failures an upgrade could
+            # plausibly fix, and only retries when the version genuinely moved.
+            if args.auto_update and worth_updating_for(text):
+                if auto_update("That failed. "):
+                    say("Trying again...")
+                    code, files, tail = run_download(build_command(args, url), args)
+                    text = "\n".join(tail)
+            if code != 0:
+                # Silence is the worst outcome for a download started from the
+                # phone, so failure pings too — at priority 1, unlike a finish.
+                if args.notify:
+                    notify("Download failed: %s"
+                           % (info.get("title") or url)[:120], SOUND_FAIL)
+                sys.exit(explain_failure(text, bool(args.cookies)))
 
     # Leave no fragments behind — the whole point of the split paths.
     try:
@@ -617,7 +997,14 @@ def main():
         pass
 
     if not files:
-        say("Finished, but yt-dlp did not report a filename. Check %s" % args.to)
+        # For a resumed playlist this is the normal, happy outcome, not a
+        # mystery — say so plainly rather than falling back to a shrug.
+        if args.playlist and args.resume:
+            say()
+            say("Nothing new — everything in that range was already downloaded.")
+            say("Use --no-resume to fetch them again.")
+        else:
+            say("Finished, but yt-dlp did not report a filename. Check %s" % args.to)
         return
 
     if args.quiet:
@@ -634,9 +1021,21 @@ def main():
     else:
         say("Done. %d files saved to %s" % (len(files), os.path.basename(args.to)))
 
+    if partial:
+        say()
+        say("Some items in the playlist did not download.")
+        say(explain_failure("\n".join(tail), bool(args.cookies)))
+        if args.resume:
+            say()
+            say("Re-run the same command to retry just the missing ones.")
+
     if args.notify:
-        notify("Downloaded %s" % (os.path.basename(files[0]) if len(files) == 1
-                                  else "%d files" % len(files)))
+        if partial:
+            notify("Playlist partly done: %d file(s), some items failed"
+                   % len(files), SOUND_FAIL)
+        else:
+            notify("Downloaded %s" % (os.path.basename(files[0]) if len(files) == 1
+                                      else "%d files" % len(files)))
 
     # The proactive half, once a day, and deliberately *after* the download —
     # so the common case is that the upgrade already happened by the time a

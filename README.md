@@ -58,15 +58,45 @@ osacompile -o "/Applications/YouTube Download.app" ~/ytdl-accessible/YouTubeDown
 
 ```
 ytdl                       URL from the clipboard
-ytdl <url>                 best audio, original codec
-ytdl <url> --wav           decoded WAV, ready for a DAW session
-ytdl <url> --video         best video and audio, merged to MP4
-ytdl <url> --mp3           MP3 320 (a conversion, and it says so)
+ytdl <url>                 your default format, into your default folder
 ytdl <url> --info          what you would get, downloads nothing
+```
 
-  --to PATH                destination folder
+**Choosing a format**
+
+```
+  --format KIND            best, m4a, opus, mp3, wav, flac or video
+  --video --mp3 --wav      shorthand for the same
+  --pick                   list the real formats and choose by number
+  --list-formats           list them and stop
+  --max-height 720         cap video height
+  --format-id 251          an exact yt-dlp format id
+  --set-default wav        remember a format, so you stop typing the flag
+  --settings               show what you have saved
+```
+
+**Part of a video**
+
+```
+  --from 1:30              start there (also accepts 90 or 1:02:03)
+  --to-time 3:45           stop there
+  --chapters               also split into one file per chapter
+  --subtitles              also fetch English subtitles as .srt
+```
+
+**Playlists**
+
+```
+  --playlist               the whole list, into its own numbered folder
+  --items 1-10             or 3,5,7 — just those
+  --no-resume              re-fetch items already downloaded
+```
+
+**Everything else**
+
+```
+  --to PATH                a different folder, just this once
   --name "..."             filename, without extension
-  --playlist               opt in to the whole playlist
   --progress               a percentage line every 10 seconds, no faster
   --cookies [BROWSER]      sign-in cookies, for "confirm you're not a bot"
   --notify                 Pushover ping on finish and on failure
@@ -75,10 +105,14 @@ ytdl <url> --info          what you would get, downloads nothing
   --no-auto-update         never upgrade yt-dlp on its own
 ```
 
-yt-dlp keeps itself current without being asked — see below.
-
 Downloads default to `~/Library/Mobile Documents/com~apple~CloudDocs/Youtube Downloads`
-(iCloud Drive). Change it per run with `--to`, or edit `DEST` at the top of the script.
+(iCloud Drive). `ytdl --set-default --to ~/Music` changes that for good; `--to` changes
+it for one run.
+
+**Nothing here ever opens a file.** Downloads are written and left alone, so whatever
+app owns the format on your Mac is never launched. If double-clicking a download opens
+something you don't want, that is macOS file association, not this tool — and
+`--set-default` lets you pick a format whose association you're happy with.
 
 ## Design notes
 
@@ -106,6 +140,24 @@ reported the 130 kbps AAC while the download quietly took the 106 kbps Opus.
 on the end. Honouring that silently would drop a few hundred files on you. The count
 comes from `--flat-playlist --playlist-items 0`, which reports `playlist_count`
 without fetching the entries.
+
+**A playlist must be listed flat, not extracted.** With `--playlist`, the metadata
+call uses `--flat-playlist`. Without it, `-J` extracts every entry in full — for a
+channel's uploads that is hundreds of round trips, and it simply times out before
+anything downloads. Flat returns the list and its titles in one request and leaves
+per-video work to the download itself.
+
+**Partial playlist success is reported as partial success.** `--ignore-errors` keeps
+yt-dlp going past a bad item, and it still exits non-zero afterwards. Treating that as
+total failure would throw away news of every file that *did* arrive, leaving re-running
+as the only way to find out. Each item is announced as it starts, an archive file beside
+the downloads records what completed, and re-running the same command resumes rather
+than starting over.
+
+**An exact format id is taken as it comes.** `--format-id 251` (Opus) once landed as a
+fatter, lossier `.m4a`, because a *saved default* of m4a was still being applied on top
+of the stream that had been explicitly named. A saved default must never silently
+transcode a stream you went to the trouble of asking for; an explicit flag still wins.
 
 **Auto-update is triggered by failure, not by a timer.** YouTube breaks yt-dlp
 periodically, and the moment a newer version is worth having is the moment a download
