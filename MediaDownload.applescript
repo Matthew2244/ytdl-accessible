@@ -5,11 +5,16 @@
 -- Dialogs rather than a Terminal window: every dialog here is readable by
 -- VoiceOver, and a scrolling terminal is exactly what ytdl exists to avoid.
 --
--- On personality: the jokes live in the *wording*, never in extra steps. The
--- welcome appears once and never again, and no dialog exists purely to be
--- funny — a gag you have to dismiss stops being one the second time. Anyone
--- listening to this rather than looking at it pays for every word, so the
--- character rides along inside sentences that were going to be said anyway.
+-- Three rules this file follows throughout:
+--
+-- 1. Every choice says what it does. A list item reading "Default format" is
+--    useless on its own; it reads "Default format (now: best)" so the current
+--    state arrives with the label rather than after a guess.
+-- 2. Every toggle says whether it is on. Same reason.
+-- 3. The personality lives in wording that was going to be said anyway. No
+--    dialog exists purely to be funny — a gag you have to dismiss stops being
+--    one the second time, and someone listening rather than looking pays for
+--    every word.
 --
 -- A GUI-launched app gets a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so
 -- Homebrew is invisible to it and yt-dlp would not be found. Hence the
@@ -28,7 +33,6 @@ on run
 	end repeat
 end run
 
--- Once. Ever. Then it gets out of the way for good.
 on greetOnce()
 	try
 		do shell script "test -f " & welcomeFlag
@@ -36,9 +40,9 @@ on greetOnce()
 	end try
 	display dialog "Hello. I fetch things off the internet so you can keep them." & return & return & ¬
 		"Copy a link — YouTube, Bandcamp, SoundCloud, the BBC, about 1,750 sites — then launch me and press Return twice. That is the whole job." & return & return & ¬
-		"You can paste several links at once, separated by spaces, and I will work through them." & return & return & ¬
+		"You can paste several links at once, separated by spaces, and I will work through them one at a time." & return & return & ¬
 		"I never open what I download and I never play anything at you. I put the file where you asked and get out of the way." & return & return & ¬
-		"You will only see this once." ¬
+		"Everything is under the More button: where files go, what format, and how things are going. You will only see this message once." ¬
 		with title "Hello from " & appTitle buttons {"Let's go"} default button "Let's go"
 	do shell script "mkdir -p $HOME/.config/ytdl && touch " & welcomeFlag
 end greetOnce
@@ -47,29 +51,55 @@ on pick(theList)
 	return item (random number from 1 to (count of theList)) of theList
 end pick
 
+on ytdl(argsText)
+	return do shell script shellPrefix & ytdlPath & " " & argsText
+end ytdl
+
+-- One saved setting, as text. Used to label every control with its state.
+on settingValue(theKey)
+	try
+		return my ytdl("--get " & theKey)
+	on error
+		return "?"
+	end try
+end settingValue
+
+-- A link is only offered if yt-dlp actually recognises it. Asking yt-dlp's own
+-- matchers beats guessing from the hostname, and it is offline, so it costs
+-- about a third of a second and never a network round trip. Without this, any
+-- old article or search-results page on the clipboard got offered as a
+-- download.
 on clipboardLink()
 	try
 		set clipText to (the clipboard as text)
 		set trimmed to do shell script "printf %s " & quoted form of clipText & ¬
 			" | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'"
-		if trimmed starts with "http" then return trimmed
+		if trimmed does not start with "http" then return {"", ""}
+		try
+			set siteName to my ytdl("--check-url " & quoted form of trimmed)
+			return {trimmed, siteName}
+		on error
+			return {"", ""}
+		end try
 	end try
-	return ""
+	return {"", ""}
 end clipboardLink
 
--- Returns false when the user is done with us.
 on mainScreen()
-	set startURL to my clipboardLink()
+	set found to my clipboardLink()
+	set startURL to item 1 of found
+	set siteName to item 2 of found
 
-	-- Offered as its own question, with a real No, so declining the clipboard
-	-- takes you to an empty field rather than making you clear it by hand.
+	-- Its own question with a real No, so declining the clipboard leaves you
+	-- at an empty field instead of making you clear it by hand.
 	if startURL is not "" then
 		set shown to startURL
 		if (count of shown) > 70 then set shown to (text 1 thru 70 of shown) & "..."
 		set ans to button returned of (display dialog ¬
-			my pick({"There is a link on your clipboard:", "Found this on your clipboard:", ¬
-				"Your clipboard is holding:"}) & return & return & shown ¬
-			with title appTitle buttons {"Quit", "No, something else", "Yes, fetch it"} ¬
+			"There is a " & siteName & " link on your clipboard:" & return & return & shown & ¬
+			return & return & "Fetch this one, or start with an empty box?" ¬
+			with title appTitle ¬
+			buttons {"Quit", "No, something else", "Yes, fetch it"} ¬
 			default button "Yes, fetch it")
 		if ans is "Quit" then return false
 		if ans is "No, something else" then set startURL to ""
@@ -81,16 +111,17 @@ on mainScreen()
 
 	try
 		set reply to display dialog opener & return & ¬
-			"(Several links at once? Separate them with spaces.)" ¬
+			"Paste a link. Several at once? Separate them with spaces." & return & ¬
+			"More: settings, progress, and what sites work." ¬
 			default answer startURL with title appTitle ¬
-			buttons {"Quit", "More…", "Fetch it"} default button "Fetch it"
+			buttons {"Quit", "More", "Fetch it"} default button "Fetch it"
 	on error number -128
 		return false
 	end try
 
 	set pressed to button returned of reply
 	if pressed is "Quit" then return false
-	if pressed is "More…" then
+	if pressed is "More" then
 		moreScreen()
 		return true
 	end if
@@ -102,10 +133,16 @@ on mainScreen()
 		return true
 	end if
 
-	set formatNames to {"My usual", "Best quality, no converting", ¬
-		"M4A - plays anywhere", "Opus - best per kilobyte", ¬
-		"WAV - for a REAPER session", "MP3 320", "FLAC - lossless", "Video - MP4"}
-	set chosen to choose from list formatNames with prompt "How would you like it?" ¬
+	set defFmt to my settingValue("format")
+	set formatNames to {"My usual (" & defFmt & ")", ¬
+		"Best quality - never converts anything", ¬
+		"M4A - plays anywhere, converts non-AAC", ¬
+		"Opus - smallest for the quality", ¬
+		"WAV - uncompressed, for a REAPER session", ¬
+		"MP3 320 - most compatible, always converts", ¬
+		"FLAC - lossless", "Video - MP4 with picture"}
+	set chosen to choose from list formatNames with prompt ¬
+		"How would you like it? Your usual is " & defFmt & "." ¬
 		default items {item 1 of formatNames}
 	if chosen is false then return true
 	set chosenName to item 1 of chosen
@@ -119,7 +156,6 @@ on mainScreen()
 	if chosenName starts with "FLAC" then set theFlag to " --format flac"
 	if chosenName starts with "Video" then set theFlag to " --format video"
 
-	-- Quote each link separately so several can go in one run.
 	set quoted_urls to ""
 	set AppleScript's text item delimiters to " "
 	set parts to text items of theURL
@@ -132,24 +168,18 @@ on mainScreen()
 		end if
 	end repeat
 
-	-- A link copied from a queue carries the whole set with it. Ask rather
-	-- than guess: silently taking two hundred tracks would be far worse than
-	-- silently taking one.
 	if theURL contains "list=" then
 		set plAnswer to button returned of (display dialog ¬
-			"Heads up — that link has a whole playlist attached to it." with title appTitle ¬
+			"Heads up — that link has a whole playlist attached to it." & return & return & ¬
+			"All of it puts every track in its own numbered folder." with title appTitle ¬
 			buttons {"Never mind", "Just this one", "All of it"} default button "Just this one")
 		if plAnswer is "Never mind" then return true
 		if plAnswer is "All of it" then set theFlag to theFlag & " --playlist"
 	end if
 
-	-- Check the first link before starting anything, so a bad paste or an
-	-- unavailable video fails as a sentence in a dialog rather than as a
-	-- background job that quietly does nothing.
 	if howMany is 1 then
 		try
-			set infoText to do shell script shellPrefix & ytdlPath & quoted_urls & ¬
-				theFlag & " --info"
+			set infoText to my ytdl(quoted_urls & theFlag & " --info")
 		on error errText
 			display dialog "Hit a wall:" & return & return & errText with title appTitle ¬
 				buttons {"OK"} default button "OK" with icon stop
@@ -160,7 +190,7 @@ on mainScreen()
 			set summary to summary & return & paragraph 2 of infoText
 		end try
 	else
-		set summary to (howMany as text) & " links queued up."
+		set summary to (howMany as text) & " links queued up, one after another."
 	end if
 
 	-- Detached on purpose: the app must never sit blocking on a long download
@@ -180,12 +210,11 @@ on mainScreen()
 	return true
 end mainScreen
 
--- The app detaches its downloads, so this asks ytdl what is actually running
--- rather than guessing. Re-checking is a button, not a timer: a dialog that
--- refreshed itself would talk over VoiceOver mid-sentence.
+-- Re-checking is a button, never a timer: a dialog that refreshed itself would
+-- talk over VoiceOver mid-sentence.
 on progressScreen()
 	repeat
-		set report to do shell script shellPrefix & ytdlPath & " --jobs"
+		set report to my ytdl("--jobs")
 		set ans to button returned of (display dialog report with title appTitle ¬
 			buttons {"Back", "Check again"} default button "Back")
 		if ans is "Back" then return
@@ -194,70 +223,95 @@ end progressScreen
 
 on moreScreen()
 	repeat
-		set opts to {"How is it going?", "Where downloads go", "Default format", ¬
-			"Ping my phone when finished", "Say progress while downloading", ¬
-			"Show all my settings", "Is a site supported?", "Update yt-dlp", "Back"}
-		set choice to choose from list opts with prompt "What would you like to do?" ¬
+		-- Every label carries its current value, so the state arrives with the
+		-- name rather than needing a separate trip to find out.
+		set sTo to my settingValue("to")
+		set AppleScript's text item delimiters to "/"
+		set shortTo to last text item of sTo
+		set AppleScript's text item delimiters to ""
+		set opts to {"How is it going? - anything downloading now", ¬
+			"Where downloads go (now: " & shortTo & ")", ¬
+			"Default format (now: " & my settingValue("format") & ")", ¬
+			"Ping my phone when finished (now: " & my settingValue("notify") & ")", ¬
+			"Say progress while downloading (now: " & my settingValue("progress") & ")", ¬
+			"Keep yt-dlp updated (now: " & my settingValue("auto_update") & ")", ¬
+			"Show all my settings - the full list", ¬
+			"Is a site supported? - check any site", ¬
+			"Update yt-dlp now", "Back to the link box"}
+		set choice to choose from list opts with prompt ¬
+			"Settings and tools. Each one shows what it is set to now." ¬
 			default items {item 1 of opts}
 		if choice is false then return
 		set what to item 1 of choice
-		if what is "Back" then return
+		if what starts with "Back" then return
 
-		if what is "How is it going?" then
+		if what starts with "How is it going" then
 			progressScreen()
 
-		else if what is "Show all my settings" then
-			set current to do shell script shellPrefix & ytdlPath & " --settings"
-			display dialog current with title appTitle buttons {"OK"} default button "OK"
+		else if what starts with "Show all" then
+			display dialog my ytdl("--settings") with title appTitle ¬
+				buttons {"OK"} default button "OK"
 
-		else if what is "Where downloads go" then
+		else if what starts with "Where downloads go" then
 			try
-				set theFolder to choose folder with prompt "Where should downloads land?"
-				do shell script shellPrefix & ytdlPath & " --set to=" & ¬
-					quoted form of (POSIX path of theFolder)
+				set theFolder to choose folder with prompt ¬
+					"Where should downloads land? Currently " & shortTo & "."
+				my ytdl("--set to=" & quoted form of (POSIX path of theFolder))
 				display dialog "Right, they go there now." with title appTitle ¬
 					buttons {"Good"} default button "Good"
 			on error number -128
 			end try
 
-		else if what is "Default format" then
-			set fmts to {"best", "m4a", "opus", "mp3", "wav", "flac", "video"}
+		else if what starts with "Default format" then
+			set nowFmt to my settingValue("format")
+			set fmts to {"best - never converts anything", "m4a - plays anywhere", ¬
+				"opus - smallest for the quality", "mp3 - always converts", ¬
+				"wav - uncompressed", "flac - lossless", "video - MP4"}
 			set f to choose from list fmts with prompt ¬
-				"Default format. 'best' never converts anything." default items {"best"}
+				"Default format. Currently " & nowFmt & "." default items {item 1 of fmts}
 			if f is not false then
-				do shell script shellPrefix & ytdlPath & " --set format=" & (item 1 of f)
-				display dialog "Default is now " & (item 1 of f) & "." with title appTitle ¬
+				set AppleScript's text item delimiters to " "
+				set justFmt to first text item of (item 1 of f)
+				set AppleScript's text item delimiters to ""
+				my ytdl("--set format=" & justFmt)
+				display dialog "Default is now " & justFmt & "." with title appTitle ¬
 					buttons {"Good"} default button "Good"
 			end if
 
-		else if what is "Ping my phone when finished" then
-			set a to button returned of (display dialog ¬
-				"Send a Pushover notification when a download finishes?" with title appTitle ¬
-				buttons {"Cancel", "No", "Yes"} default button "Yes")
-			if a is not "Cancel" then
-				do shell script shellPrefix & ytdlPath & " --set notify=" & a
-			end if
+		else if what starts with "Ping my phone" then
+			my toggle("notify", "Send a Pushover notification when a download finishes?")
 
-		else if what is "Say progress while downloading" then
-			set a to button returned of (display dialog ¬
-				"Announce a percentage every ten seconds during a download?" with title appTitle ¬
-				buttons {"Cancel", "No", "Yes"} default button "No")
-			if a is not "Cancel" then
-				do shell script shellPrefix & ytdlPath & " --set progress=" & a
-			end if
+		else if what starts with "Say progress" then
+			my toggle("progress", "Announce a percentage every ten seconds during a download?")
 
-		else if what is "Is a site supported?" then
+		else if what starts with "Keep yt-dlp updated" then
+			my toggle("auto_update", "Let yt-dlp update itself when a download fails and a newer version exists?")
+
+		else if what starts with "Is a site supported" then
 			try
-				set q to text returned of (display dialog "Which site?" default answer "bandcamp" ¬
-					with title appTitle buttons {"Cancel", "Check"} default button "Check")
-				set r to do shell script shellPrefix & ytdlPath & " --sites " & quoted form of q
-				display dialog r with title appTitle buttons {"OK"} default button "OK"
+				set q to text returned of (display dialog ¬
+					"Which site? Type part of its name, like bandcamp or bbc." ¬
+					default answer "bandcamp" with title appTitle ¬
+					buttons {"Cancel", "Check"} default button "Check")
+				display dialog my ytdl("--sites " & quoted form of q) with title appTitle ¬
+					buttons {"OK"} default button "OK"
 			on error number -128
 			end try
 
-		else if what is "Update yt-dlp" then
-			set r to do shell script shellPrefix & ytdlPath & " --update"
-			display dialog r with title appTitle buttons {"OK"} default button "OK"
+		else if what starts with "Update yt-dlp" then
+			display dialog my ytdl("--update") with title appTitle ¬
+				buttons {"OK"} default button "OK"
 		end if
 	end repeat
 end moreScreen
+
+-- A yes/no setting, always stating what it is now before asking.
+on toggle(theKey, question)
+	set nowVal to my settingValue(theKey)
+	set a to button returned of (display dialog question & return & return & ¬
+		"It is currently " & nowVal & "." with title appTitle ¬
+		buttons {"Cancel", "No", "Yes"} default button "Cancel")
+	if a is "Cancel" then return
+	my ytdl("--set " & theKey & "=" & a)
+	display dialog "Set to " & a & "." with title appTitle buttons {"Good"} default button "Good"
+end toggle

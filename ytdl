@@ -484,6 +484,80 @@ def clock(seconds):
 
 # ---------------------------------------------------------------- yt-dlp
 
+def yt_dlp_python():
+    """The interpreter yt-dlp runs on, read from its own shebang.
+
+    Homebrew installs yt-dlp into a versioned virtualenv, so hardcoding the
+    path would break on the next upgrade. The shebang always points at the
+    right one.
+    """
+    try:
+        with open(yt_dlp_path()) as fh:
+            first = fh.readline().strip()
+        if first.startswith("#!") and os.path.exists(first[2:].split()[0]):
+            return first[2:].split()[0]
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+CHECK_SNIPPET = """
+import sys
+from yt_dlp.extractor import gen_extractor_classes
+url = sys.argv[1]
+for ie in gen_extractor_classes():
+    name = ie.IE_NAME
+    if name.lower().startswith('generic'):
+        continue
+    try:
+        if ie.suitable(url):
+            print(name)
+            break
+    except Exception:
+        pass
+"""
+
+
+def recognised_by(url):
+    """Which yt-dlp extractor claims this URL, ignoring the generic catch-all.
+
+    Asks yt-dlp's own matchers rather than guessing from the hostname, and does
+    it entirely offline — no request is made, so this is fast enough to run
+    before a dialog opens. The generic extractor is skipped on purpose: it
+    matches literally any http link, so counting it would mean "recognised"
+    told you nothing.
+    """
+    interpreter = yt_dlp_python()
+    if not interpreter:
+        return None
+    try:
+        out = subprocess.run([interpreter, "-c", CHECK_SNIPPET, url],
+                             capture_output=True, text=True, timeout=30)
+        return (out.stdout or "").strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def do_check_url(url):
+    """Would yt-dlp know what to do with this? Exit 0 if yes."""
+    if not url:
+        sys.exit(1)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        sys.exit(1)
+    name = recognised_by(url)
+    if name:
+        say(name)
+        return
+    # A direct link to a media file is worth accepting even with no extractor
+    # behind it — the generic path handles those perfectly well.
+    if re.search(r"\.(mp3|mp4|m4a|opus|ogg|wav|flac|webm|mkv|mov|aac|m3u8)(\?|$)",
+                 parsed.path, re.I):
+        say("direct media file")
+        return
+    sys.exit(1)
+
+
 def job_write(state, **fields):
     """Record what this run is doing. Never allowed to break a download."""
     path = os.environ.get("YTDL_JOB_FILE")
@@ -1482,6 +1556,11 @@ def main():
                     help="yt-dlp's own full option list")
     ap.add_argument("--jobs", action="store_true",
                     help="what is downloading now, and what finished recently")
+    ap.add_argument("--get", nargs="?", const="", metavar="KEY",
+                    help="print settings as key=value, for scripts and the app")
+    ap.add_argument("--check-url", metavar="URL",
+                    help="does yt-dlp recognise this link? prints the site name, "
+                         "exits non-zero if not. Offline and instant.")
     for i, raw in enumerate(sys.argv[1:]):
         if raw == "--yt-dlp":
             sys.exit('--yt-dlp needs an equals sign, because its value starts '
@@ -1494,6 +1573,28 @@ def main():
 
     if args.sites is not None:
         do_sites(args.sites)
+        return
+
+    if args.get is not None:
+        cfg_now = load_config()
+        values = {"to": setting(cfg_now, "to", DEST),
+                  "format": setting(cfg_now, "format", "best"),
+                  "notify": yes_no(setting(cfg_now, "notify", False)),
+                  "progress": yes_no(setting(cfg_now, "progress", False)),
+                  "auto_update": yes_no(setting(cfg_now, "auto_update", True)),
+                  "cookies": setting(cfg_now, "cookies", None) or "no",
+                  "max_height": (setting(cfg_now, "max_height", None) or "none")}
+        if args.get:
+            if args.get not in values:
+                sys.exit("Not a setting: %s" % args.get)
+            say(str(values[args.get]))
+        else:
+            for key, _ in SETTINGS:
+                say("%s=%s" % (key, values[key]))
+        return
+
+    if args.check_url:
+        do_check_url(args.check_url)
         return
 
     if args.jobs:

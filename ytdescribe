@@ -342,18 +342,24 @@ def mix(clips, source_audio, out_path, quiet):
 def main():
     ap = argparse.ArgumentParser(add_help=True, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("url")
-    ap.add_argument("--to", default=DEST)
+    ap.add_argument("url", help="the video to describe")
+    ap.add_argument("--to", default=DEST,
+                    help="where to put the description files")
     ap.add_argument("--generate", action="store_true",
                     help="skip the search for an authored version")
-    ap.add_argument("--no-search", dest="search", action="store_false")
-    ap.add_argument("--frames", type=int, default=40)
-    ap.add_argument("--voice", default=DEFAULT_VOICE)
+    ap.add_argument("--no-search", dest="search", action="store_false",
+                    help="do not look for a version someone else described")
+    ap.add_argument("--frames", type=int, default=40, metavar="N",
+                    help="how many moments to describe (default 40)")
+    ap.add_argument("--voice", default=DEFAULT_VOICE, metavar="ID",
+                    help="ElevenLabs voice for the spoken track")
     ap.add_argument("--spoken", action="store_true", help="also render speech")
     ap.add_argument("--mix", action="store_true",
                     help="also mix that speech with the original audio")
-    ap.add_argument("--keep-video", action="store_true")
-    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--keep-video", action="store_true",
+                    help="keep the video that was downloaded to read")
+    ap.add_argument("--quiet", action="store_true",
+                    help="only say what matters")
     args = ap.parse_args()
 
     ytdlp = need("yt-dlp", "Install it with: brew install yt-dlp")
