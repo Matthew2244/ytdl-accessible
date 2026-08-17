@@ -2,15 +2,20 @@
 --
 -- Not YouTube-only: yt-dlp handles about 1,750 sites.
 --
--- Dialogs rather than a Terminal window: every dialog here is readable by
--- VoiceOver, and a scrolling terminal is exactly what ytdl exists to avoid.
+-- ACCESSIBILITY NOTE, and the reason this file reads the way it does:
 --
--- Three rules this file follows throughout:
+-- AppleScript's `display dialog` has no per-button help tag. VoiceOver is given
+-- exactly two things — the button's label and the dialog's body text — and
+-- nothing else. So every button here is explained in one of those two places:
+-- either the label says what it does on its own, or the body has a line naming
+-- each button. There is no third option, and leaving a bare "More" or "OK"
+-- unexplained means a control that announces itself as a word with no meaning.
 --
--- 1. Every choice says what it does. A list item reading "Default format" is
---    useless on its own; it reads "Default format (now: best)" so the current
---    state arrives with the label rather than after a guess.
--- 2. Every toggle says whether it is on. Same reason.
+-- Three rules followed throughout:
+--
+-- 1. Every button is accounted for in the dialog text, or is self-explaining.
+-- 2. Every setting shows its current value in its own label, so nothing has to
+--    be selected to find out what it was.
 -- 3. The personality lives in wording that was going to be said anyway. No
 --    dialog exists purely to be funny — a gag you have to dismiss stops being
 --    one the second time, and someone listening rather than looking pays for
@@ -42,7 +47,8 @@ on greetOnce()
 		"Copy a link — YouTube, Bandcamp, SoundCloud, the BBC, about 1,750 sites — then launch me and press Return twice. That is the whole job." & return & return & ¬
 		"You can paste several links at once, separated by spaces, and I will work through them one at a time." & return & return & ¬
 		"I never open what I download and I never play anything at you. I put the file where you asked and get out of the way." & return & return & ¬
-		"Everything is under the More button: where files go, what format, and how things are going. You will only see this message once." ¬
+		"Everything else lives under the More button, including a Help entry that explains every screen. You will only see this message once." & return & return & ¬
+		"One button: Let's go, which closes this and starts." ¬
 		with title "Hello from " & appTitle buttons {"Let's go"} default button "Let's go"
 	do shell script "mkdir -p $HOME/.config/ytdl && touch " & welcomeFlag
 end greetOnce
@@ -55,7 +61,6 @@ on ytdl(argsText)
 	return do shell script shellPrefix & ytdlPath & " " & argsText
 end ytdl
 
--- One saved setting, as text. Used to label every control with its state.
 on settingValue(theKey)
 	try
 		return my ytdl("--get " & theKey)
@@ -90,14 +95,15 @@ on mainScreen()
 	set startURL to item 1 of found
 	set siteName to item 2 of found
 
-	-- Its own question with a real No, so declining the clipboard leaves you
-	-- at an empty field instead of making you clear it by hand.
 	if startURL is not "" then
 		set shown to startURL
 		if (count of shown) > 70 then set shown to (text 1 thru 70 of shown) & "..."
 		set ans to button returned of (display dialog ¬
 			"There is a " & siteName & " link on your clipboard:" & return & return & shown & ¬
-			return & return & "Fetch this one, or start with an empty box?" ¬
+			return & return & ¬
+			"Yes, fetch it — download this one." & return & ¬
+			"No, something else — go to the link box, empty." & return & ¬
+			"Quit — close the app." ¬
 			with title appTitle ¬
 			buttons {"Quit", "No, something else", "Yes, fetch it"} ¬
 			default button "Yes, fetch it")
@@ -110,9 +116,11 @@ on mainScreen()
 	if startURL is not "" then set opener to "Ready when you are."
 
 	try
-		set reply to display dialog opener & return & ¬
-			"Paste a link. Several at once? Separate them with spaces." & return & ¬
-			"More: settings, progress, and what sites work." ¬
+		set reply to display dialog opener & return & return & ¬
+			"Type or paste a link. Several at once? Separate them with spaces." & return & return & ¬
+			"Fetch it — choose a format, then download." & return & ¬
+			"More — settings, progress, supported sites, and help." & return & ¬
+			"Quit — close the app." ¬
 			default answer startURL with title appTitle ¬
 			buttons {"Quit", "More", "Fetch it"} default button "Fetch it"
 	on error number -128
@@ -128,7 +136,8 @@ on mainScreen()
 
 	set theURL to text returned of reply
 	if theURL is "" then
-		display dialog "That was nothing at all. I need a link." with title appTitle ¬
+		display dialog "That was nothing at all. I need a link." & return & return & ¬
+			"Fair enough — back to the link box." with title appTitle ¬
 			buttons {"Fair enough"} default button "Fair enough"
 		return true
 	end if
@@ -142,8 +151,9 @@ on mainScreen()
 		"MP3 320 - most compatible, always converts", ¬
 		"FLAC - lossless", "Video - MP4 with picture"}
 	set chosen to choose from list formatNames with prompt ¬
-		"How would you like it? Your usual is " & defFmt & "." ¬
-		default items {item 1 of formatNames}
+		"How would you like it? Your usual is " & defFmt & ". Choose one and press Use this, or Back to return." ¬
+		default items {item 1 of formatNames} ¬
+		OK button name "Use this" cancel button name "Back"
 	if chosen is false then return true
 	set chosenName to item 1 of chosen
 
@@ -171,7 +181,9 @@ on mainScreen()
 	if theURL contains "list=" then
 		set plAnswer to button returned of (display dialog ¬
 			"Heads up — that link has a whole playlist attached to it." & return & return & ¬
-			"All of it puts every track in its own numbered folder." with title appTitle ¬
+			"Just this one — only the single track or video." & return & ¬
+			"All of it — every item, in its own numbered folder." & return & ¬
+			"Never mind — back to the link box." with title appTitle ¬
 			buttons {"Never mind", "Just this one", "All of it"} default button "Just this one")
 		if plAnswer is "Never mind" then return true
 		if plAnswer is "All of it" then set theFlag to theFlag & " --playlist"
@@ -181,7 +193,8 @@ on mainScreen()
 		try
 			set infoText to my ytdl(quoted_urls & theFlag & " --info")
 		on error errText
-			display dialog "Hit a wall:" & return & return & errText with title appTitle ¬
+			display dialog "Hit a wall:" & return & return & errText & return & return & ¬
+				"OK — back to the link box. Nothing was downloaded." with title appTitle ¬
 				buttons {"OK"} default button "OK" with icon stop
 			return true
 		end try
@@ -202,7 +215,10 @@ on mainScreen()
 	set sendoff to my pick({"Off I go.", "On it.", "Consider it done.", ¬
 		"Right, fetching.", "Say no more."})
 	set answer2 to button returned of (display dialog sendoff & return & return & summary & ¬
-		return & return & "You will hear the finished tone when it lands." ¬
+		return & return & "You will hear the finished tone when it lands." & return & return & ¬
+		"Grab another — back to the link box." & return & ¬
+		"How is it going? — check on the download." & return & ¬
+		"Done — close the app. The download keeps going." ¬
 		with title appTitle buttons {"Done", "How is it going?", "Grab another"} ¬
 		default button "Grab another")
 	if answer2 is "Done" then return false
@@ -215,8 +231,10 @@ end mainScreen
 on progressScreen()
 	repeat
 		set report to my ytdl("--jobs")
-		set ans to button returned of (display dialog report with title appTitle ¬
-			buttons {"Back", "Check again"} default button "Back")
+		set ans to button returned of (display dialog report & return & return & ¬
+			"Check again — re-read the current state." & return & ¬
+			"Back — return to what you were doing." ¬
+			with title appTitle buttons {"Back", "Check again"} default button "Back")
 		if ans is "Back" then return
 	end repeat
 end progressScreen
@@ -237,10 +255,13 @@ on moreScreen()
 			"Keep yt-dlp updated (now: " & my settingValue("auto_update") & ")", ¬
 			"Show all my settings - the full list", ¬
 			"Is a site supported? - check any site", ¬
-			"Update yt-dlp now", "Back to the link box"}
+			"Update yt-dlp now - fetch the newest version", ¬
+			"Help - what every screen and button does", ¬
+			"Back to the link box"}
 		set choice to choose from list opts with prompt ¬
-			"Settings and tools. Each one shows what it is set to now." ¬
-			default items {item 1 of opts}
+			"Settings and tools. Each line shows what it is set to now. Choose one and press Open, or Back to return." ¬
+			default items {item 1 of opts} ¬
+			OK button name "Open" cancel button name "Back"
 		if choice is false then return
 		set what to item 1 of choice
 		if what starts with "Back" then return
@@ -248,16 +269,21 @@ on moreScreen()
 		if what starts with "How is it going" then
 			progressScreen()
 
+		else if what starts with "Help" then
+			helpScreen()
+
 		else if what starts with "Show all" then
-			display dialog my ytdl("--settings") with title appTitle ¬
+			display dialog my ytdl("--settings") & return & return & ¬
+				"OK — back to the settings list." with title appTitle ¬
 				buttons {"OK"} default button "OK"
 
 		else if what starts with "Where downloads go" then
 			try
 				set theFolder to choose folder with prompt ¬
-					"Where should downloads land? Currently " & shortTo & "."
+					"Where should downloads land? Currently " & shortTo & ". Choose a folder and press Choose, or Cancel to leave it as it is."
 				my ytdl("--set to=" & quoted form of (POSIX path of theFolder))
-				display dialog "Right, they go there now." with title appTitle ¬
+				display dialog "Right, they go there now." & return & return & ¬
+					"Good — back to the settings list." with title appTitle ¬
 					buttons {"Good"} default button "Good"
 			on error number -128
 			end try
@@ -268,13 +294,16 @@ on moreScreen()
 				"opus - smallest for the quality", "mp3 - always converts", ¬
 				"wav - uncompressed", "flac - lossless", "video - MP4"}
 			set f to choose from list fmts with prompt ¬
-				"Default format. Currently " & nowFmt & "." default items {item 1 of fmts}
+				"Default format. Currently " & nowFmt & ". Choose one and press Use this, or Back to leave it." ¬
+				default items {item 1 of fmts} ¬
+				OK button name "Use this" cancel button name "Back"
 			if f is not false then
 				set AppleScript's text item delimiters to " "
 				set justFmt to first text item of (item 1 of f)
 				set AppleScript's text item delimiters to ""
 				my ytdl("--set format=" & justFmt)
-				display dialog "Default is now " & justFmt & "." with title appTitle ¬
+				display dialog "Default is now " & justFmt & "." & return & return & ¬
+					"Good — back to the settings list." with title appTitle ¬
 					buttons {"Good"} default button "Good"
 			end if
 
@@ -290,28 +319,54 @@ on moreScreen()
 		else if what starts with "Is a site supported" then
 			try
 				set q to text returned of (display dialog ¬
-					"Which site? Type part of its name, like bandcamp or bbc." ¬
+					"Which site? Type part of its name, like bandcamp or bbc." & return & return & ¬
+					"Check — search the list of about 1,750 sites." & return & ¬
+					"Cancel — back to the settings list." ¬
 					default answer "bandcamp" with title appTitle ¬
 					buttons {"Cancel", "Check"} default button "Check")
-				display dialog my ytdl("--sites " & quoted form of q) with title appTitle ¬
+				display dialog my ytdl("--sites " & quoted form of q) & return & return & ¬
+					"OK — back to the settings list." with title appTitle ¬
 					buttons {"OK"} default button "OK"
 			on error number -128
 			end try
 
 		else if what starts with "Update yt-dlp" then
-			display dialog my ytdl("--update") with title appTitle ¬
+			display dialog my ytdl("--update") & return & return & ¬
+				"OK — back to the settings list." with title appTitle ¬
 				buttons {"OK"} default button "OK"
 		end if
 	end repeat
 end moreScreen
 
+on helpScreen()
+	display dialog "What everything does." & return & return & ¬
+		"THE LINK BOX. Type or paste a link and press Fetch it. Several links at once work — separate them with spaces. More opens settings and tools. Quit closes the app." & return & return & ¬
+		"CLIPBOARD. If you copied a link before launching, I offer it. I only offer links yt-dlp actually recognises, so an article or a search page will not be suggested. Say No to get an empty box instead." & return & return & ¬
+		"FORMATS. My usual is whatever you set as your default. Best quality never converts anything, so nothing loses quality. Naming a format guarantees the file type but converts when the source is not already that codec." & return & return & ¬
+		"AFTER YOU PRESS FETCH. The download runs in the background, so you can close the app and it carries on. You get a tone when it finishes, and a different one if it fails." & return & return & ¬
+		"More help — the second page: progress, playlists and settings." ¬
+		with title appTitle buttons {"More help"} default button "More help"
+
+	display dialog "The rest of it." & return & return & ¬
+		"HOW IS IT GOING. Shows what is downloading now and what finished recently. Check again re-reads it. It never refreshes on its own, because that would interrupt VoiceOver mid-sentence." & return & return & ¬
+		"PLAYLISTS. If a link has a playlist attached, I ask first. All of it puts every track in its own numbered folder and remembers what it already got, so running it again resumes." & return & return & ¬
+		"SETTINGS. Every line in the More list shows its current value in brackets, so you never have to open one to find out what it was." & return & return & ¬
+		"NOTHING IS EVER OPENED. I write the file and leave it alone. No app is launched and nothing plays." & return & return & ¬
+		"Back — return to the settings list." ¬
+		with title appTitle buttons {"Back"} default button "Back"
+end helpScreen
+
 -- A yes/no setting, always stating what it is now before asking.
 on toggle(theKey, question)
 	set nowVal to my settingValue(theKey)
 	set a to button returned of (display dialog question & return & return & ¬
-		"It is currently " & nowVal & "." with title appTitle ¬
+		"It is currently " & nowVal & "." & return & return & ¬
+		"Yes — turn it on.  No — turn it off.  Cancel — leave it as it is." ¬
+		with title appTitle ¬
 		buttons {"Cancel", "No", "Yes"} default button "Cancel")
 	if a is "Cancel" then return
 	my ytdl("--set " & theKey & "=" & a)
-	display dialog "Set to " & a & "." with title appTitle buttons {"Good"} default button "Good"
+	display dialog "Set to " & a & "." & return & return & ¬
+		"Good — back to the settings list." with title appTitle ¬
+		buttons {"Good"} default button "Good"
 end toggle
