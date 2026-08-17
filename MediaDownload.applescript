@@ -9,8 +9,7 @@
 -- welcome appears once and never again, and no dialog exists purely to be
 -- funny — a gag you have to dismiss stops being one the second time. Anyone
 -- listening to this rather than looking at it pays for every word, so the
--- character has to ride along inside sentences that were going to be said
--- anyway.
+-- character rides along inside sentences that were going to be said anyway.
 --
 -- A GUI-launched app gets a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), so
 -- Homebrew is invisible to it and yt-dlp would not be found. Hence the
@@ -37,6 +36,7 @@ on greetOnce()
 	end try
 	display dialog "Hello. I fetch things off the internet so you can keep them." & return & return & ¬
 		"Copy a link — YouTube, Bandcamp, SoundCloud, the BBC, about 1,750 sites — then launch me and press Return twice. That is the whole job." & return & return & ¬
+		"You can paste several links at once, separated by spaces, and I will work through them." & return & return & ¬
 		"I never open what I download and I never play anything at you. I put the file where you asked and get out of the way." & return & return & ¬
 		"You will only see this once." ¬
 		with title "Hello from " & appTitle buttons {"Let's go"} default button "Let's go"
@@ -47,35 +47,51 @@ on pick(theList)
 	return item (random number from 1 to (count of theList)) of theList
 end pick
 
--- Returns false when the user is done with us.
-on mainScreen()
-	set startURL to ""
+on clipboardLink()
 	try
 		set clipText to (the clipboard as text)
 		set trimmed to do shell script "printf %s " & quoted form of clipText & ¬
 			" | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'"
-		if trimmed starts with "http" then set startURL to trimmed
+		if trimmed starts with "http" then return trimmed
 	end try
+	return ""
+end clipboardLink
+
+-- Returns false when the user is done with us.
+on mainScreen()
+	set startURL to my clipboardLink()
+
+	-- Offered as its own question, with a real No, so declining the clipboard
+	-- takes you to an empty field rather than making you clear it by hand.
+	if startURL is not "" then
+		set shown to startURL
+		if (count of shown) > 70 then set shown to (text 1 thru 70 of shown) & "..."
+		set ans to button returned of (display dialog ¬
+			my pick({"There is a link on your clipboard:", "Found this on your clipboard:", ¬
+				"Your clipboard is holding:"}) & return & return & shown ¬
+			with title appTitle buttons {"Quit", "No, something else", "Yes, fetch it"} ¬
+			default button "Yes, fetch it")
+		if ans is "Quit" then return false
+		if ans is "No, something else" then set startURL to ""
+	end if
 
 	set opener to my pick({"What are we grabbing?", "Point me at something.", ¬
 		"Give me a link and I will go and get it.", "What have you got?"})
-	if startURL is not "" then
-		set opener to my pick({"Found a link on your clipboard. Shall I?", ¬
-			"There is a link on your clipboard — Return takes it.", ¬
-			"Clipboard says you want this one."})
-	end if
+	if startURL is not "" then set opener to "Ready when you are."
 
 	try
-		set reply to display dialog opener default answer startURL with title appTitle ¬
-			buttons {"Quit", "Settings", "Fetch it"} default button "Fetch it"
+		set reply to display dialog opener & return & ¬
+			"(Several links at once? Separate them with spaces.)" ¬
+			default answer startURL with title appTitle ¬
+			buttons {"Quit", "More…", "Fetch it"} default button "Fetch it"
 	on error number -128
 		return false
 	end try
 
 	set pressed to button returned of reply
 	if pressed is "Quit" then return false
-	if pressed is "Settings" then
-		settingsScreen()
+	if pressed is "More…" then
+		moreScreen()
 		return true
 	end if
 
@@ -103,6 +119,19 @@ on mainScreen()
 	if chosenName starts with "FLAC" then set theFlag to " --format flac"
 	if chosenName starts with "Video" then set theFlag to " --format video"
 
+	-- Quote each link separately so several can go in one run.
+	set quoted_urls to ""
+	set AppleScript's text item delimiters to " "
+	set parts to text items of theURL
+	set AppleScript's text item delimiters to ""
+	set howMany to 0
+	repeat with aPart in parts
+		if (aPart as text) is not "" then
+			set quoted_urls to quoted_urls & " " & quoted form of (aPart as text)
+			set howMany to howMany + 1
+		end if
+	end repeat
+
 	-- A link copied from a queue carries the whole set with it. Ask rather
 	-- than guess: silently taking two hundred tracks would be far worse than
 	-- silently taking one.
@@ -114,50 +143,70 @@ on mainScreen()
 		if plAnswer is "All of it" then set theFlag to theFlag & " --playlist"
 	end if
 
-	-- Check the link before starting anything, so a bad paste or an
+	-- Check the first link before starting anything, so a bad paste or an
 	-- unavailable video fails as a sentence in a dialog rather than as a
 	-- background job that quietly does nothing.
-	try
-		set infoText to do shell script shellPrefix & ytdlPath & " " & ¬
-			quoted form of theURL & theFlag & " --info"
-	on error errText
-		display dialog "Hit a wall:" & return & return & errText with title appTitle ¬
-			buttons {"OK"} default button "OK" with icon stop
-		return true
-	end try
-
-	set summary to paragraph 1 of infoText
-	try
-		set summary to summary & return & paragraph 2 of infoText
-	end try
+	if howMany is 1 then
+		try
+			set infoText to do shell script shellPrefix & ytdlPath & quoted_urls & ¬
+				theFlag & " --info"
+		on error errText
+			display dialog "Hit a wall:" & return & return & errText with title appTitle ¬
+				buttons {"OK"} default button "OK" with icon stop
+			return true
+		end try
+		set summary to paragraph 1 of infoText
+		try
+			set summary to summary & return & paragraph 2 of infoText
+		end try
+	else
+		set summary to (howMany as text) & " links queued up."
+	end if
 
 	-- Detached on purpose: the app must never sit blocking on a long download
 	-- with no way to report progress. The ytdl-done and ytdl-fail Pushover
 	-- tones are the completion signal, which is why --notify is not optional.
-	do shell script shellPrefix & "nohup " & ytdlPath & " " & quoted form of theURL & ¬
-		theFlag & " --notify > $HOME/.ytdl-app.log 2>&1 &"
+	do shell script shellPrefix & "nohup " & ytdlPath & quoted_urls & theFlag & ¬
+		" --notify > $HOME/.ytdl-app.log 2>&1 &"
 
 	set sendoff to my pick({"Off I go.", "On it.", "Consider it done.", ¬
 		"Right, fetching.", "Say no more."})
-	display dialog sendoff & return & return & summary & return & return & ¬
-		"You will hear the finished tone when it lands." with title appTitle ¬
-		buttons {"Grab another", "Done"} default button "Grab another"
-	if button returned of result is "Done" then return false
+	set answer2 to button returned of (display dialog sendoff & return & return & summary & ¬
+		return & return & "You will hear the finished tone when it lands." ¬
+		with title appTitle buttons {"Done", "How is it going?", "Grab another"} ¬
+		default button "Grab another")
+	if answer2 is "Done" then return false
+	if answer2 is "How is it going?" then progressScreen()
 	return true
 end mainScreen
 
-on settingsScreen()
+-- The app detaches its downloads, so this asks ytdl what is actually running
+-- rather than guessing. Re-checking is a button, not a timer: a dialog that
+-- refreshed itself would talk over VoiceOver mid-sentence.
+on progressScreen()
 	repeat
-		set opts to {"Where downloads go", "Default format", ¬
+		set report to do shell script shellPrefix & ytdlPath & " --jobs"
+		set ans to button returned of (display dialog report with title appTitle ¬
+			buttons {"Back", "Check again"} default button "Back")
+		if ans is "Back" then return
+	end repeat
+end progressScreen
+
+on moreScreen()
+	repeat
+		set opts to {"How is it going?", "Where downloads go", "Default format", ¬
 			"Ping my phone when finished", "Say progress while downloading", ¬
-			"Show me everything", "Back"}
-		set choice to choose from list opts with prompt ¬
-			"Settings — what would you like to change?" default items {item 1 of opts}
+			"Show all my settings", "Is a site supported?", "Update yt-dlp", "Back"}
+		set choice to choose from list opts with prompt "What would you like to do?" ¬
+			default items {item 1 of opts}
 		if choice is false then return
 		set what to item 1 of choice
 		if what is "Back" then return
 
-		if what is "Show me everything" then
+		if what is "How is it going?" then
+			progressScreen()
+
+		else if what is "Show all my settings" then
 			set current to do shell script shellPrefix & ytdlPath & " --settings"
 			display dialog current with title appTitle buttons {"OK"} default button "OK"
 
@@ -196,6 +245,19 @@ on settingsScreen()
 			if a is not "Cancel" then
 				do shell script shellPrefix & ytdlPath & " --set progress=" & a
 			end if
+
+		else if what is "Is a site supported?" then
+			try
+				set q to text returned of (display dialog "Which site?" default answer "bandcamp" ¬
+					with title appTitle buttons {"Cancel", "Check"} default button "Check")
+				set r to do shell script shellPrefix & ytdlPath & " --sites " & quoted form of q
+				display dialog r with title appTitle buttons {"OK"} default button "OK"
+			on error number -128
+			end try
+
+		else if what is "Update yt-dlp" then
+			set r to do shell script shellPrefix & ytdlPath & " --update"
+			display dialog r with title appTitle buttons {"OK"} default button "OK"
 		end if
 	end repeat
-end settingsScreen
+end moreScreen

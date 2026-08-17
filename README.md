@@ -101,6 +101,32 @@ fastest way to make a tool feel like homework.
   --settings               show what you have saved
 ```
 
+**Several at once**
+
+```
+ytdl <url> <url> <url>       several links, one after another
+  --batch links.txt          a file of links, one per line
+  --jobs                     what is downloading now, what just finished
+```
+
+They run in sequence rather than in parallel, which keeps sites from
+rate-limiting you, and **one failure never abandons the rest** — the run reports
+how many made it. `--jobs` works from anywhere, including while a download
+started by the app is still going.
+
+**Anything this does not cover**
+
+```
+  --yt-dlp="--write-thumbnail"    raw arguments straight to yt-dlp
+  --yt-dlp-help                   every yt-dlp option there is
+```
+
+yt-dlp has roughly 200 options. Giving each one a wrapper flag would make
+`--help` unreadable by ear — which is precisely the problem this tool exists to
+solve. So the common ones are curated above and everything else passes straight
+through. Full coverage, no bloat. (The equals sign is required: a value starting
+with a dash looks like a flag to the argument parser.)
+
 **Part of a video**
 
 ```

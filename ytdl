@@ -11,8 +11,10 @@ the whole download interrupting itself and never finishes a sentence. Here you
 get one line per event and silence in between.
 
     ytdl <url>              your default format, into your default folder
+    ytdl <url> <url> <url>  several at once, one after another
     ytdl                    take the URL from the clipboard
     ytdl <url> --info       title, length, what you would get — no download
+    ytdl --jobs             what is downloading now, what finished recently
 
   choosing a format
     --format KIND           best, m4a, opus, mp3, wav, flac or video
@@ -37,6 +39,14 @@ get one line per event and silence in between.
     --settings              show what is set
     --set notify=yes        change one setting without the questions
     --set-default wav       shorthand for --set format=wav
+
+  several at once
+    --batch links.txt       a file of links, one per line
+    --jobs                  what is downloading now, and what just finished
+
+  anything this does not cover
+    --yt-dlp="--flag val"   raw arguments handed straight to yt-dlp
+    --yt-dlp-help           every yt-dlp option there is
 
   everything else
     --sites bandcamp        is a site supported? (about 1,750 are)
@@ -73,6 +83,15 @@ file type.
 Downloads land wherever --set-default --to puts them. Part-files never do —
 they go to a local scratch directory, so half a download is never synced to
 your phone and then deleted.
+
+Several links run one after another rather than at once, which keeps sites from
+rate-limiting you, and **one failure never abandons the rest** — the same rule
+playlists follow. The run reports how many of them made it.
+
+yt-dlp has roughly 200 options. Wrapping each one would make this help
+unreadable by ear, which is the problem the tool exists to solve, so instead
+--yt-dlp passes anything straight through and --yt-dlp-help lists the lot. That
+is full coverage without the bloat.
 """
 
 import argparse
@@ -119,6 +138,12 @@ CONFIG = os.path.join(HOME, ".config", "ytdl", "config.json")
 # re-downloading. Kept beside the files it describes, not in a global store —
 # delete the folder and the bookkeeping goes with it.
 ARCHIVE_NAME = ".ytdl-archive.txt"
+
+# One small file per run, so anything else — the app, another terminal — can
+# ask what is happening. The app detaches its downloads, so without this there
+# is no way for it to answer "is it still going?".
+JOBS = os.path.join(HOME, ".cache", "ytdl-jobs")
+JOB_KEEP = 6 * 60 * 60   # finished jobs linger this long, then are swept
 
 FORMATS = ("best", "m4a", "opus", "mp3", "wav", "flac", "video")
 
@@ -458,6 +483,101 @@ def clock(seconds):
 
 
 # ---------------------------------------------------------------- yt-dlp
+
+def job_write(state, **fields):
+    """Record what this run is doing. Never allowed to break a download."""
+    path = os.environ.get("YTDL_JOB_FILE")
+    if not path:
+        return
+    try:
+        data = {}
+        if os.path.exists(path):
+            with open(path) as fh:
+                data = json.load(fh)
+        data.update(fields)
+        data["state"] = state
+        data["updated"] = time.time()
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+    except (OSError, ValueError):
+        pass
+
+
+def job_start(urls):
+    """Claim a job file for this run, and sweep away stale ones."""
+    try:
+        os.makedirs(JOBS, exist_ok=True)
+        now = time.time()
+        for name in os.listdir(JOBS):
+            full = os.path.join(JOBS, name)
+            try:
+                if now - os.path.getmtime(full) > JOB_KEEP:
+                    os.remove(full)
+            except OSError:
+                pass
+        os.environ["YTDL_JOB_FILE"] = os.path.join(JOBS, "%d.json" % os.getpid())
+        job_write("starting", total=len(urls), done=0, title="", percent="")
+    except OSError:
+        pass
+
+
+def do_jobs():
+    """What is downloading right now, and what finished recently."""
+    try:
+        names = sorted(os.listdir(JOBS))
+    except OSError:
+        names = []
+    rows = []
+    for name in names:
+        try:
+            with open(os.path.join(JOBS, name)) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        pid = name.split(".")[0]
+        alive = False
+        if pid.isdigit():
+            try:
+                os.kill(int(pid), 0)
+                alive = True
+            except OSError:
+                alive = False
+        # A job whose process is gone but which never reported an ending was
+        # killed. Saying "downloading" forever would be a lie.
+        state = data.get("state", "?")
+        if not alive and state in ("starting", "downloading"):
+            state = "stopped"
+        rows.append((data.get("updated", 0), state, data, alive))
+
+    if not rows:
+        say("Nothing downloading, and nothing finished recently.")
+        return
+    rows.sort(key=lambda r: r[0], reverse=True)
+    running = [r for r in rows if r[3]]
+    finished = [r for r in rows if not r[3]]
+
+    if running:
+        say("Downloading now:")
+        for _, state, data, _ in running:
+            bits = [data.get("title") or "(reading the link)"]
+            if (data.get("total") or 1) > 1:
+                bits.append("%d of %d" % ((data.get("done") or 0) + 1, data["total"]))
+            if data.get("percent"):
+                bits.append(data["percent"])
+            say("  %s" % " - ".join(bits))
+    else:
+        say("Nothing downloading right now.")
+
+    if finished:
+        say()
+        say("Recently:")
+        for _, state, data, _ in finished[:8]:
+            word = {"done": "finished", "failed": "FAILED",
+                    "partial": "partly done", "stopped": "stopped"}.get(state, state)
+            ago = spoken_duration(time.time() - (data.get("updated") or 0)) or "moments"
+            say("  %-11s %s  (%s ago)"
+                % (word, (data.get("title") or "?")[:52], ago))
+
 
 def yt_dlp_path():
     path = shutil.which("yt-dlp")
@@ -1055,6 +1175,11 @@ def build_command(args, url):
     else:
         cmd.append("--no-progress")
 
+    if args.passthrough:
+        # Last, so a raw flag can override anything this wrapper decided.
+        import shlex
+        cmd += shlex.split(args.passthrough)
+
     cmd.append(url)
     return cmd
 
@@ -1095,6 +1220,7 @@ def run_download(cmd, args):
                     eta = parts[2] if len(parts) > 2 else ""
                     say("  %s%s" % (pct.strip(),
                                     ", %s left" % eta if eta and eta != "NA" else ""))
+                    job_write("downloading", percent=pct.strip())
             elif "has already been downloaded" in line:
                 say("Already downloaded — leaving the existing file alone.")
     except KeyboardInterrupt:
@@ -1109,10 +1235,179 @@ def run_download(cmd, args):
 
 # ---------------------------------------------------------------- main
 
+def download_one(args, url):
+    """One link, start to finish. Returns a one-word outcome.
+
+    Returns rather than exits, because with several links a failure on
+    one must not abandon the rest — the same rule playlists already
+    follow.
+    """
+    info, error = fetch_info(url, args.cookies, selector(args), flat=args.playlist)
+    if info is None:
+        # Private, unavailable, or a bot check — this is the *common* failure,
+        # and it lands before the download, so it needs the ping just as much.
+        if args.notify:
+            notify("Download failed: %s" % url[:120], SOUND_FAIL)
+        say(explain_failure(error, bool(args.cookies), site_of(None, url)))
+        job_write("failed", title=url[:90])
+        return "failed"
+
+    job_write("downloading", title=(info.get("title") or "")[:90], percent="")
+
+    if args.info:
+        do_info(info)
+        return "info"
+
+    if (args.pick or args.list_formats) and args.playlist:
+        # A flat playlist listing carries no per-video formats, and the videos
+        # in one list rarely offer the same set anyway.
+        say("--pick and --list-formats work on a single item, not a set.")
+        say("Use --format or --max-height for a whole list.")
+        return "skipped"
+
+    if args.pick or args.list_formats:
+        describe(info)
+        say()
+        chosen = do_list_formats(info, interactive=args.pick)
+        if not chosen:
+            return "skipped"
+        args.format_id = chosen
+        say()
+
+    # Is the named stream audio-only? Decides whether it gets remuxed to an
+    # audio container or merged as video. "id+bestaudio" from --pick is always
+    # a video pairing.
+    args.format_audio_only = False
+    if args.format_id and "+" not in args.format_id:
+        for fmt in info.get("formats") or []:
+            if str(fmt.get("format_id")) == str(args.format_id):
+                vcodec = fmt.get("vcodec")
+                args.format_audio_only = not (vcodec and vcodec != "none")
+                break
+
+    if not args.quiet:
+        if not (args.pick or args.list_formats):
+            describe(info)
+        if in_a_playlist(url, info) and not args.playlist:
+            count = playlist_size(url)
+            say("That link is part of a set%s — taking just this one." %
+                (" of %d items" % count if count else ""))
+            say("Add --playlist for the whole thing.")
+        start, end = parse_time(args.start), parse_time(args.end)
+        if start is not None or end is not None:
+            say("Just the section from %s to %s."
+                % (spoken_duration(start) or "the start",
+                   spoken_duration(end) or "the end"))
+        if args.playlist:
+            say("Downloading the playlist%s%s..."
+                % (" (items %s)" % args.items if args.items else "",
+                   ", skipping any already fetched" if args.resume else ""))
+        else:
+            say("Downloading...")
+
+    os.makedirs(args.to, exist_ok=True)
+    os.makedirs(SCRATCH, exist_ok=True)
+
+    code, files, tail = run_download(build_command(args, url), args)
+
+    if code == 130:
+        return "stopped"
+
+    partial = False
+    if code != 0:
+        text = "\n".join(tail)
+
+        # A playlist that got part of the way is a partial success, not a
+        # failure. --ignore-errors keeps yt-dlp going past a bad item and it
+        # still exits non-zero, so treating that as total failure would throw
+        # away news of every file that *did* arrive — and re-running would be
+        # the only way to find out. Report both instead.
+        if args.playlist and files:
+            partial = True
+        else:
+            # Otherwise a failure is the moment a newer yt-dlp is actually
+            # worth having, so this is where the auto-update earns its keep —
+            # not on a timer. It only fires for failures an upgrade could
+            # plausibly fix, and only retries when the version genuinely moved.
+            if args.auto_update and worth_updating_for(text):
+                if auto_update("That failed. "):
+                    say("Trying again...")
+                    code, files, tail = run_download(build_command(args, url), args)
+                    text = "\n".join(tail)
+            if code != 0:
+                # Silence is the worst outcome for a download started from the
+                # phone, so failure pings too — at priority 1, unlike a finish.
+                if args.notify:
+                    notify("Download failed: %s"
+                           % (info.get("title") or url)[:120], SOUND_FAIL)
+                say(explain_failure(text, bool(args.cookies),
+                                    site_of(info, url)))
+                job_write("failed", title=(info.get("title") or url)[:90])
+                return "failed"
+
+    # Leave no fragments behind — the whole point of the split paths.
+    try:
+        for leftover in os.listdir(SCRATCH):
+            path = os.path.join(SCRATCH, leftover)
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+    except OSError:
+        pass
+
+    if not files:
+        # For a resumed playlist this is the normal, happy outcome, not a
+        # mystery — say so plainly rather than falling back to a shrug.
+        if args.playlist and args.resume:
+            say()
+            say("Nothing new — everything in that range was already downloaded.")
+            say("Use --no-resume to fetch them again.")
+        else:
+            say("Finished, but yt-dlp did not report a filename. Check %s" % args.to)
+        return "nothing"
+
+    if args.quiet:
+        for path in files:
+            say(path)
+        return "ok"
+
+    say()
+    if len(files) == 1:
+        name = os.path.basename(files[0])
+        size = spoken_size(os.path.getsize(files[0])) if os.path.exists(files[0]) else None
+        say("Done. Saved to %s as %s%s" %
+            (os.path.basename(args.to), name, " (%s)" % size if size else ""))
+    else:
+        say("Done. %d files saved to %s" % (len(files), os.path.basename(args.to)))
+
+    if partial:
+        say()
+        say("Some items in the playlist did not download.")
+        say(explain_failure("\n".join(tail), bool(args.cookies),
+                            site_of(info, url)))
+        if args.resume:
+            say()
+            say("Re-run the same command to retry just the missing ones.")
+
+    if args.notify:
+        if partial:
+            notify("Playlist partly done: %d file(s), some items failed"
+                   % len(files), SOUND_FAIL)
+        else:
+            notify("Downloaded %s" % (os.path.basename(files[0]) if len(files) == 1
+                                      else "%d files" % len(files)))
+
+    job_write("partial" if partial else "done",
+              title=(info.get("title") or "")[:90], percent="")
+    return "partial" if partial else "ok"
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("url", nargs="?", help="the link (default: the clipboard)")
+    ap.add_argument("urls", nargs="*", metavar="URL",
+                    help="one or more links (default: the clipboard)")
     ap.add_argument("--to", help="destination folder")
     ap.add_argument("--name", help="filename, without extension")
 
@@ -1175,6 +1470,22 @@ def main():
                     help="walk through every setting, one question at a time")
     ap.add_argument("--set", dest="set_pairs", action="append", metavar="KEY=VALUE",
                     help="set one setting without the questions, e.g. --set notify=yes")
+    ap.add_argument("--batch", metavar="FILE",
+                    help="a file of links, one per line")
+    # Needs = rather than a space: a value starting with a dash looks like a
+    # flag to argparse, and --yt-dlp "--write-thumbnail" would fail.
+    ap.add_argument("--yt-dlp", dest="passthrough", metavar="ARGS",
+                    help='raw arguments straight to yt-dlp, for anything this '
+                         'wrapper does not cover. Needs an equals sign: '
+                         '--yt-dlp="--write-thumbnail"')
+    ap.add_argument("--yt-dlp-help", action="store_true",
+                    help="yt-dlp's own full option list")
+    ap.add_argument("--jobs", action="store_true",
+                    help="what is downloading now, and what finished recently")
+    for i, raw in enumerate(sys.argv[1:]):
+        if raw == "--yt-dlp":
+            sys.exit('--yt-dlp needs an equals sign, because its value starts '
+                     'with a dash:\n  ytdl <url> --yt-dlp="--write-thumbnail"')
     args = ap.parse_args()
 
     if args.update:
@@ -1183,6 +1494,23 @@ def main():
 
     if args.sites is not None:
         do_sites(args.sites)
+        return
+
+    if args.jobs:
+        do_jobs()
+        return
+
+    if args.yt_dlp_help:
+        # Every yt-dlp option, unfiltered. Wrapping ~200 flags individually
+        # would make --help unreadable by ear, which is the problem this tool
+        # exists to solve — so the full list stays one command away and
+        # --yt-dlp passes anything from it straight through.
+        say("Every yt-dlp option. Pass any of them with:  ytdl <url> "
+            "--yt-dlp \"--flag value\"")
+        say()
+        out = subprocess.run([yt_dlp_path(), "--help"], capture_output=True,
+                             text=True, timeout=60)
+        say(out.stdout)
         return
 
     if args.setup:
@@ -1230,160 +1558,49 @@ def main():
             and parse_time(args.end) <= parse_time(args.start)):
         sys.exit("--to-time has to come after --from.")
 
-    url = check_url(args.url or url_from_clipboard())
+    urls = [check_url(u) for u in args.urls]
+    if args.batch:
+        try:
+            with open(os.path.expanduser(args.batch)) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        urls.append(check_url(line))
+        except OSError as exc:
+            sys.exit("Could not read %s: %s" % (args.batch, exc))
+    if not urls:
+        urls = [check_url(url_from_clipboard())]
     args.to = os.path.abspath(os.path.expanduser(args.to))
 
-    if not args.url and not args.quiet:
+    if not args.urls and not args.batch and not args.quiet:
         say("Using the URL on the clipboard.")
+    if len(urls) > 1 and args.name:
+        sys.exit("--name sets one filename, so it only works with one link.")
 
-    info, error = fetch_info(url, args.cookies, selector(args), flat=args.playlist)
-    if info is None:
-        # Private, unavailable, or a bot check — this is the *common* failure,
-        # and it lands before the download, so it needs the ping just as much.
+    job_start(urls)
+    outcomes = []
+    for i, one in enumerate(urls, 1):
+        if len(urls) > 1 and not args.quiet:
+            say()
+            say("--- %d of %d ---" % (i, len(urls)))
+        job_write("downloading", done=i - 1, percent="")
+        outcomes.append(download_one(args, one))
+        # A named format id or a --pick choice belongs to the link it was
+        # chosen for, and must not leak onto the next one.
+        args.format_id = None
+
+    if len(urls) > 1 and not args.quiet:
+        good = outcomes.count("ok") + outcomes.count("partial")
+        bad = outcomes.count("failed")
+        say()
+        say("All done. %d of %d succeeded%s."
+            % (good, len(urls), ", %d failed" % bad if bad else ""))
+        job_write("failed" if good == 0 else ("partial" if bad else "done"),
+                  title="%d of %d links" % (good, len(urls)), percent="")
         if args.notify:
-            notify("Download failed: %s" % url[:120], SOUND_FAIL)
-        sys.exit(explain_failure(error, bool(args.cookies), site_of(None, url)))
+            notify("Batch finished: %d of %d succeeded" % (good, len(urls)),
+                   SOUND_FAIL if bad else SOUND_DONE)
 
-    if args.info:
-        do_info(info)
-        return
-
-    if (args.pick or args.list_formats) and args.playlist:
-        # A flat playlist listing carries no per-video formats, and the videos
-        # in one list rarely offer the same set anyway.
-        sys.exit("--pick and --list-formats work on a single video, not a "
-                 "playlist.\nUse --format or --max-height for a whole list.")
-
-    if args.pick or args.list_formats:
-        describe(info)
-        say()
-        chosen = do_list_formats(info, interactive=args.pick)
-        if not chosen:
-            return
-        args.format_id = chosen
-        say()
-
-    # Is the named stream audio-only? Decides whether it gets remuxed to an
-    # audio container or merged as video. "id+bestaudio" from --pick is always
-    # a video pairing.
-    args.format_audio_only = False
-    if args.format_id and "+" not in args.format_id:
-        for fmt in info.get("formats") or []:
-            if str(fmt.get("format_id")) == str(args.format_id):
-                vcodec = fmt.get("vcodec")
-                args.format_audio_only = not (vcodec and vcodec != "none")
-                break
-
-    if not args.quiet:
-        if not (args.pick or args.list_formats):
-            describe(info)
-        if in_a_playlist(url, info) and not args.playlist:
-            count = playlist_size(url)
-            say("That link is part of a set%s — taking just this one." %
-                (" of %d items" % count if count else ""))
-            say("Add --playlist for the whole thing.")
-        start, end = parse_time(args.start), parse_time(args.end)
-        if start is not None or end is not None:
-            say("Just the section from %s to %s."
-                % (spoken_duration(start) or "the start",
-                   spoken_duration(end) or "the end"))
-        if args.playlist:
-            say("Downloading the playlist%s%s..."
-                % (" (items %s)" % args.items if args.items else "",
-                   ", skipping any already fetched" if args.resume else ""))
-        else:
-            say("Downloading...")
-
-    os.makedirs(args.to, exist_ok=True)
-    os.makedirs(SCRATCH, exist_ok=True)
-
-    code, files, tail = run_download(build_command(args, url), args)
-
-    if code == 130:
-        return
-
-    partial = False
-    if code != 0:
-        text = "\n".join(tail)
-
-        # A playlist that got part of the way is a partial success, not a
-        # failure. --ignore-errors keeps yt-dlp going past a bad item and it
-        # still exits non-zero, so treating that as total failure would throw
-        # away news of every file that *did* arrive — and re-running would be
-        # the only way to find out. Report both instead.
-        if args.playlist and files:
-            partial = True
-        else:
-            # Otherwise a failure is the moment a newer yt-dlp is actually
-            # worth having, so this is where the auto-update earns its keep —
-            # not on a timer. It only fires for failures an upgrade could
-            # plausibly fix, and only retries when the version genuinely moved.
-            if args.auto_update and worth_updating_for(text):
-                if auto_update("That failed. "):
-                    say("Trying again...")
-                    code, files, tail = run_download(build_command(args, url), args)
-                    text = "\n".join(tail)
-            if code != 0:
-                # Silence is the worst outcome for a download started from the
-                # phone, so failure pings too — at priority 1, unlike a finish.
-                if args.notify:
-                    notify("Download failed: %s"
-                           % (info.get("title") or url)[:120], SOUND_FAIL)
-                sys.exit(explain_failure(text, bool(args.cookies),
-                                         site_of(info, url)))
-
-    # Leave no fragments behind — the whole point of the split paths.
-    try:
-        for leftover in os.listdir(SCRATCH):
-            path = os.path.join(SCRATCH, leftover)
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                os.remove(path)
-    except OSError:
-        pass
-
-    if not files:
-        # For a resumed playlist this is the normal, happy outcome, not a
-        # mystery — say so plainly rather than falling back to a shrug.
-        if args.playlist and args.resume:
-            say()
-            say("Nothing new — everything in that range was already downloaded.")
-            say("Use --no-resume to fetch them again.")
-        else:
-            say("Finished, but yt-dlp did not report a filename. Check %s" % args.to)
-        return
-
-    if args.quiet:
-        for path in files:
-            say(path)
-        return
-
-    say()
-    if len(files) == 1:
-        name = os.path.basename(files[0])
-        size = spoken_size(os.path.getsize(files[0])) if os.path.exists(files[0]) else None
-        say("Done. Saved to %s as %s%s" %
-            (os.path.basename(args.to), name, " (%s)" % size if size else ""))
-    else:
-        say("Done. %d files saved to %s" % (len(files), os.path.basename(args.to)))
-
-    if partial:
-        say()
-        say("Some items in the playlist did not download.")
-        say(explain_failure("\n".join(tail), bool(args.cookies),
-                            site_of(info, url)))
-        if args.resume:
-            say()
-            say("Re-run the same command to retry just the missing ones.")
-
-    if args.notify:
-        if partial:
-            notify("Playlist partly done: %d file(s), some items failed"
-                   % len(files), SOUND_FAIL)
-        else:
-            notify("Downloaded %s" % (os.path.basename(files[0]) if len(files) == 1
-                                      else "%d files" % len(files)))
 
     # The proactive half, once a day, and deliberately *after* the download —
     # so the common case is that the upgrade already happened by the time a
