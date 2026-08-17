@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""ytdl — download audio or video from YouTube, and say what it is doing.
+"""ytdl — download audio or video from a link, and say what it is doing.
+
+Not just YouTube. yt-dlp handles about 1,750 sites — Bandcamp, SoundCloud,
+Vimeo, the BBC, archive.org, Mixcloud — and falls back to a generic attempt on
+any plain media link. `ytdl --sites bandcamp` checks one.
 
 yt-dlp does the downloading. This exists for the talking: yt-dlp's own progress
 bar rewrites one terminal line many times a second, so a screen reader spends
@@ -31,6 +35,7 @@ get one line per event and silence in between.
     --no-resume             re-fetch items already downloaded
 
   everything else
+    --sites bandcamp        is a site supported? (about 1,750 are)
     --to PATH               a different folder, just this once
     --name "..."            set the filename yourself
     --progress              a percentage line every 10 seconds, no faster
@@ -43,9 +48,10 @@ get one line per event and silence in between.
 Nothing here ever opens a file. Downloads are written and left alone, so
 whatever app owns the format on your Mac is never launched.
 
-A playlist goes into its own folder, numbered in playlist order, and keeps a
-small archive file beside the files so re-running it resumes rather than
-starting over. One bad item does not abandon the rest of the list.
+A playlist — a YouTube list, a Bandcamp album, a SoundCloud set — goes into
+its own folder, numbered in order, and keeps a small archive file beside the
+files so re-running it resumes rather than starting over. One bad item does not
+abandon the rest.
 
 yt-dlp keeps itself current without being asked. It upgrades when a download
 fails and a newer release exists — the moment it actually matters — and again
@@ -53,12 +59,14 @@ at most once a day after a *successful* download, so the upgrade has usually
 already happened before a break can reach you. Neither check ever runs before
 a download: nothing stands between you and the file you asked for.
 
-The default never re-encodes. YouTube's best audio is usually Opus around
-160 kbps, which beats its 128 kbps AAC, so the codec is kept as it came and
-only the container changes: AAC lands as .m4a, Opus as .opus. --mp3 and --wav
-are conversions and are named as such.
+--format best never re-encodes: the source codec is kept and only the
+container changes, so AAC lands as .m4a and Opus as .opus. Naming a specific
+format instead (m4a, mp3, wav, flac) will convert when the source is not
+already that codec — which is a lossy generation for the lossy ones. That is
+the trade: `best` guarantees no quality loss, a named format guarantees the
+file type.
 
-Downloads land in iCloud Drive, in "Youtube Downloads". Part-files never do —
+Downloads land wherever --set-default --to puts them. Part-files never do —
 they go to a local scratch directory, so half a download is never synced to
 your phone and then deleted.
 """
@@ -77,7 +85,7 @@ import urllib.request
 
 HOME = os.path.expanduser("~")
 DEST = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs",
-                    "Youtube Downloads")
+                    "Media Downloads")
 SCRATCH = os.path.join(HOME, ".cache", "ytdl-temp")
 PUSHOVER = os.path.join(HOME, "bin", "pushover")
 
@@ -284,9 +292,30 @@ def check_url(url):
     return url
 
 
-def in_a_playlist(url):
+def in_a_playlist(url, info=None):
+    """Is there a whole set behind this link?
+
+    Two signals, because neither covers everything. YouTube collapses a list
+    to one video when --no-playlist is passed, so the metadata comes back
+    looking single and only the `list=` parameter gives it away. Every other
+    site — Bandcamp albums, SoundCloud sets, BBC series — says so in the
+    metadata instead. Keying only on `list=` made this a YouTube-only guard.
+    """
     query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    return bool(query.get("list"))
+    if query.get("list"):
+        return True
+    if info and (info.get("_type") == "playlist" or info.get("entries")):
+        return True
+    return False
+
+
+def site_of(info, url):
+    """Which extractor handled this, for wording that is not YouTube-specific."""
+    name = (info or {}).get("extractor_key") or (info or {}).get("extractor")
+    if name and name.lower() not in ("generic",):
+        return name
+    host = urllib.parse.urlparse(url).netloc
+    return host[4:] if host.startswith("www.") else (host or "the site")
 
 
 def playlist_size(url):
@@ -519,27 +548,37 @@ def auto_update(preamble=""):
 
 # ---------------------------------------------------------------- errors
 
-def explain_failure(text, cookies_used):
-    """Say the useful thing, not yt-dlp's error, whenever we recognise it."""
+def explain_failure(text, cookies_used, site=None):
+    """Say the useful thing, not yt-dlp's error, whenever we recognise it.
+
+    `site` keeps the wording honest: yt-dlp handles about 1,750 sites, and
+    blaming YouTube for a Bandcamp failure is both wrong and confusing.
+    """
     lowered = (text or "").lower()
+    who = site or "the site"
     lines = []
 
     if "confirm you" in lowered or "not a bot" in lowered or "http error 403" in lowered:
         if cookies_used:
-            lines.append("YouTube refused the download even with browser cookies.")
+            lines.append("%s refused the download even with browser cookies." % who)
             lines.append("Try a different browser:  ytdl <url> --cookies safari")
         else:
-            lines.append("YouTube wants a signed-in browser for this one.")
+            lines.append("%s wants a signed-in browser for this one." % who)
             lines.append("Try:  ytdl <url> --cookies")
+    elif "no video formats" in lowered or "unsupported url" in lowered:
+        lines.append("yt-dlp does not recognise that link.")
+        lines.append("Check what is supported with:  ytdl --sites <name>")
     elif "private video" in lowered or "is private" in lowered:
-        lines.append("That video is private.")
+        lines.append("That one is private.")
     elif "unavailable" in lowered or "removed" in lowered or "does not exist" in lowered:
         # Matched loosely on purpose: yt-dlp words this several ways ("video
         # unavailable", "This video is unavailable"), and an exact phrase match
         # silently drops back to dumping a raw traceback-ish error.
-        lines.append("That video is not available — removed, private, or blocked here.")
+        lines.append("That is not available — removed, private, or blocked here.")
     elif "members-only" in lowered or "join this channel" in lowered:
-        lines.append("That video is members-only.")
+        lines.append("That one is members-only.")
+    elif "geo" in lowered and "restrict" in lowered:
+        lines.append("That is blocked in this country.")
     elif "no space left" in lowered:
         lines.append("The disk is full.")
     else:
@@ -604,6 +643,40 @@ def do_update():
     else:
         say("Homebrew is behind: yt-dlp's current release is %s." % latest)
         say("For the newest build:  brew install --HEAD yt-dlp")
+
+
+def do_sites(needle):
+    """Answer "will this work on X?" without making him try it and find out.
+
+    yt-dlp handles roughly 1,750 sites, not just YouTube. The list is far too
+    long to read aloud, so this searches it.
+    """
+    out = subprocess.run([yt_dlp_path(), "--list-extractors"],
+                         capture_output=True, text=True, timeout=120)
+    names = [n.strip() for n in (out.stdout or "").splitlines() if n.strip()]
+    if not names:
+        say("Could not read the list of supported sites.")
+        return
+
+    if not needle:
+        say("yt-dlp supports %d sites." % len(names))
+        say("Check one with:  ytdl --sites bandcamp")
+        say()
+        say("Anything it does not recognise still gets a generic attempt, "
+            "which works on plain media links.")
+        return
+
+    hits = [n for n in names if needle.lower() in n.lower()]
+    if not hits:
+        say("Nothing matching \"%s\" in the %d supported sites." % (needle, len(names)))
+        say("It may still work — yt-dlp falls back to a generic attempt on any "
+            "link with media on it.")
+        return
+    say("%d match%s for \"%s\":" % (len(hits), "" if len(hits) == 1 else "es", needle))
+    for name in hits[:30]:
+        say("  %s" % name)
+    if len(hits) > 30:
+        say("  ...and %d more" % (len(hits) - 30))
 
 
 def describe(info):
@@ -793,7 +866,7 @@ def run_download(cmd, args):
     except KeyboardInterrupt:
         proc.terminate()
         say()
-        say("Stopped. Nothing was left in Youtube Downloads.")
+        say("Stopped. Nothing was left behind.")
         return 130, files, tail
     finally:
         proc.stdout.close()
@@ -855,10 +928,16 @@ def main():
     ap.add_argument("--set-default", metavar="FORMAT",
                     help="remember a format as your default (with --to, a folder)")
     ap.add_argument("--settings", action="store_true", help="show your saved defaults")
+    ap.add_argument("--sites", nargs="?", const="", metavar="NAME",
+                    help="is a site supported? e.g. --sites bandcamp")
     args = ap.parse_args()
 
     if args.update:
         do_update()
+        return
+
+    if args.sites is not None:
+        do_sites(args.sites)
         return
 
     cfg = load_config()
@@ -905,7 +984,7 @@ def main():
         # and it lands before the download, so it needs the ping just as much.
         if args.notify:
             notify("Download failed: %s" % url[:120], SOUND_FAIL)
-        sys.exit(explain_failure(error, bool(args.cookies)))
+        sys.exit(explain_failure(error, bool(args.cookies), site_of(None, url)))
 
     if args.info:
         do_info(info)
@@ -940,11 +1019,11 @@ def main():
     if not args.quiet:
         if not (args.pick or args.list_formats):
             describe(info)
-        if in_a_playlist(url) and not args.playlist:
+        if in_a_playlist(url, info) and not args.playlist:
             count = playlist_size(url)
-            say("That link is part of a playlist%s — taking just this one." %
-                (" of %d videos" % count if count else ""))
-            say("Add --playlist for the whole list.")
+            say("That link is part of a set%s — taking just this one." %
+                (" of %d items" % count if count else ""))
+            say("Add --playlist for the whole thing.")
         start, end = parse_time(args.start), parse_time(args.end)
         if start is not None or end is not None:
             say("Just the section from %s to %s."
@@ -992,7 +1071,8 @@ def main():
                 if args.notify:
                     notify("Download failed: %s"
                            % (info.get("title") or url)[:120], SOUND_FAIL)
-                sys.exit(explain_failure(text, bool(args.cookies)))
+                sys.exit(explain_failure(text, bool(args.cookies),
+                                         site_of(info, url)))
 
     # Leave no fragments behind — the whole point of the split paths.
     try:
@@ -1033,7 +1113,8 @@ def main():
     if partial:
         say()
         say("Some items in the playlist did not download.")
-        say(explain_failure("\n".join(tail), bool(args.cookies)))
+        say(explain_failure("\n".join(tail), bool(args.cookies),
+                            site_of(info, url)))
         if args.resume:
             say()
             say("Re-run the same command to retry just the missing ones.")

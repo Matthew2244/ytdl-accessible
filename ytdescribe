@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""ytdescribe — audio description for a video, from the best source available.
+
+    ytdescribe <url>              find or make a description
+    ytdescribe <url> --spoken     also render it as speech
+    ytdescribe <url> --mix        also mix that speech with the original audio
+
+    --generate        skip the search for an authored version, just make one
+    --no-search       do not look for a described version by someone else
+    --frames N        how many moments to describe (default 40)
+    --voice NAME      ElevenLabs voice for the spoken track
+    --to PATH         where to put the results
+    --keep-video      keep the video file that was downloaded to read
+    --quiet
+
+Three sources, in descending order of how much they are worth trusting.
+
+**1. A descriptive audio track on the video itself.** Rare, but it is real
+human description and it costs one download. Checked first, always.
+
+**2. A separate video that IS the described version.** This is where audio
+description actually lives on YouTube — searching "audio described" turns up
+whole channels of them, published as their own videos rather than as alternate
+tracks on the original. Also authored by a person, so it beats anything this
+tool can invent. You are shown the candidates and pick one; nothing is assumed
+to be a match on title alone. The search runs on YouTube whatever site the
+original came from, because that is where described versions are posted.
+
+**3. Generated from the video.** Only when the first two come up empty. Frames
+are sampled at shot changes and read in order by Claude, so the description has
+continuity rather than being a list of disconnected stills. It is *invented*
+description and it is labelled as such in every file it writes, because a
+confident wrong description is worse than an honest gap.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+
+HOME = os.path.expanduser("~")
+DEST = os.path.join(HOME, "Library", "Mobile Documents", "com~apple~CloudDocs",
+                    "Media Downloads")
+SCRATCH = os.path.join(HOME, ".cache", "ytdescribe")
+
+# A neutral narrator, deliberately not Faith's voice — a description track
+# should not sound like the assistant talking to you.
+DEFAULT_VOICE = "wkqe33083YLBV35we7yB"   # "river"
+ELEVEN = "https://api.elevenlabs.io/v1/text-to-speech/%s"
+
+# Enough to describe a shot without narrating every frame of a cut sequence.
+MIN_GAP = 4.0        # seconds between described moments
+BATCH = 10           # frames per Claude call — enough for continuity
+
+
+def say(text=""):
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+
+def need(binary, hint):
+    if not shutil.which(binary):
+        sys.exit("%s is not installed. %s" % (binary, hint))
+    return shutil.which(binary)
+
+
+def run(cmd, timeout=600, text=True):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=text, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(cmd, 1, "", str(exc))
+
+
+def timestamp(seconds):
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return "%02d:%02d:%02d" % (hours, minutes, secs)
+
+
+def srt_time(seconds):
+    whole = int(seconds)
+    ms = int((seconds - whole) * 1000)
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    return "%02d:%02d:%02d,%03d" % (hours, minutes, secs, ms)
+
+
+def safe_name(text):
+    return re.sub(r"[^\w\s.-]", "_", text).strip()[:120] or "video"
+
+
+# ------------------------------------------------------- source 1: a real track
+
+def descriptive_track(info):
+    """An audio track on this video that is marked as description.
+
+    Checked across every field that has ever carried this, because the shape
+    differs by site and has changed more than once — and a missed track means
+    inventing description that a person already wrote. Works on any of yt-dlp's
+    sites, not just YouTube; some broadcasters ship a real AD track.
+    """
+    for fmt in info.get("formats") or []:
+        if fmt.get("acodec") in (None, "none"):
+            continue
+        haystack = " ".join(str(fmt.get(k) or "") for k in
+                            ("format_note", "format", "language"))
+        track = fmt.get("audio_track")
+        if isinstance(track, dict):
+            haystack += " " + " ".join(str(v) for v in track.values())
+        if re.search(r"descri|\bAD\b|audio.?desc", haystack, re.I):
+            return fmt
+    return None
+
+
+# ---------------------------------------------- source 2: a described version
+
+def find_described_version(title, quiet):
+    """Search for a separate video that is the described cut of this one."""
+    query = "%s audio described" % re.sub(r"\s*\|.*$", "", title)[:80]
+    if not quiet:
+        say("Looking for a version someone has already described...")
+    out = run([need("yt-dlp", ""), "-J", "--no-warnings", "--flat-playlist",
+               "ytsearch6:%s" % query], timeout=180)
+    if out.returncode != 0:
+        return []
+    try:
+        entries = json.loads(out.stdout).get("entries") or []
+    except ValueError:
+        return []
+
+    hits = []
+    for entry in entries:
+        name = entry.get("title") or ""
+        if re.search(r"audio.?desc|described|\bAD\b", name, re.I):
+            hits.append({"id": entry.get("id"), "title": name,
+                         "url": "https://www.youtube.com/watch?v=%s" % entry.get("id"),
+                         "duration": entry.get("duration")})
+    return hits
+
+
+# --------------------------------------------------------- source 3: generate
+
+def sample_frames(video, folder, limit, quiet):
+    """Frames at shot changes, not on a fixed clock.
+
+    A fixed interval either misses a cut or describes the same shot five times.
+    Scene detection puts a frame where the picture actually changed, which is
+    where a description is worth writing.
+    """
+    os.makedirs(folder, exist_ok=True)
+    out = run([need("ffmpeg", ""), "-i", video,
+               "-vf", "select='eq(n\\,0)+gt(scene,0.25)',showinfo",
+               "-vsync", "vfr", "-q:v", "3",
+               os.path.join(folder, "f%04d.jpg")], timeout=900)
+
+    times = [float(m) for m in re.findall(r"pts_time:([0-9.]+)", out.stderr or "")]
+    frames = sorted(f for f in os.listdir(folder) if f.endswith(".jpg"))
+    if not frames:
+        return []
+
+    paired = list(zip(frames, times + [0.0] * len(frames)))[:len(frames)]
+
+    # Thin out anything too close together, then cap.
+    kept, last = [], -MIN_GAP
+    for name, when in paired:
+        if when - last >= MIN_GAP:
+            kept.append((os.path.join(folder, name), when))
+            last = when
+    if len(kept) > limit:
+        step = len(kept) / float(limit)
+        kept = [kept[int(i * step)] for i in range(limit)]
+    if not quiet:
+        say("%d moment%s to describe." % (len(kept), "" if len(kept) == 1 else "s"))
+    return kept
+
+
+PROMPT = """You are writing audio description for a blind listener.
+
+These are frames from "%s", in order, each labelled with its timestamp.
+%s
+
+Write one description per frame. Rules:
+- Present tense. Describe only what is visible.
+- Carry continuity across frames: name a person or place once, then refer back
+  ("she", "the same room"). You can see the earlier frames, so use them.
+- Do not describe what is being said or heard; that is not your job.
+- Do not speculate about meaning, mood or intent. No "appears to", no "seems".
+- If a frame adds nothing over the previous one, say exactly: SKIP
+- Keep each under 20 words. This has to be spoken in a gap.
+
+Reply with ONLY a JSON array, one object per frame, in order:
+[{"time": <seconds as a number>, "text": "<description or SKIP>"}]
+No markdown fence, no commentary."""
+
+
+def describe_frames(frames, title, quiet):
+    """Read the frames in order, in batches, so the description has continuity."""
+    claude = shutil.which("claude")
+    if not claude:
+        sys.exit("The `claude` CLI is not on PATH, so there is nothing to "
+                 "describe with.\nEither install it, or use --no-generate.")
+
+    described, carried = [], ""
+    for start in range(0, len(frames), BATCH):
+        chunk = frames[start:start + BATCH]
+        listing = "\n".join("%s  (%s)" % (path, timestamp(when))
+                            for path, when in chunk)
+        if carried:
+            listing += "\n\nFor continuity, the previous description ended: %s" % carried
+        if not quiet:
+            say("  describing %d-%d of %d..."
+                % (start + 1, min(start + BATCH, len(frames)), len(frames)))
+
+        out = run([claude, "-p", PROMPT % (title, listing)], timeout=900)
+        if out.returncode != 0:
+            say("  that batch failed; carrying on with what we have.")
+            continue
+
+        body = (out.stdout or "").strip()
+        body = re.sub(r"^```(?:json)?|```$", "", body, flags=re.M).strip()
+        match = re.search(r"\[.*\]", body, re.S)
+        if not match:
+            continue
+        try:
+            rows = json.loads(match.group(0))
+        except ValueError:
+            continue
+
+        for row, (_, when) in zip(rows, chunk):
+            text = str(row.get("text", "")).strip()
+            if not text or text.upper() == "SKIP":
+                continue
+            described.append({"time": float(row.get("time", when) or when),
+                              "text": text})
+            carried = text
+    described.sort(key=lambda d: d["time"])
+    return described
+
+
+# ------------------------------------------------------------------- outputs
+
+HEADER = ("This description was generated automatically by reading frames from "
+          "the video.\nIt was not written by a person and it has not been "
+          "checked. Treat it as a rough guide.\n")
+
+
+def write_text(rows, base, title, authored, quiet):
+    md, srt = base + ".description.md", base + ".description.srt"
+    with open(md, "w") as fh:
+        fh.write("# Audio description: %s\n\n" % title)
+        if not authored:
+            fh.write(HEADER + "\n")
+        for row in rows:
+            fh.write("**%s**  %s\n\n" % (timestamp(row["time"]), row["text"]))
+    with open(srt, "w") as fh:
+        for i, row in enumerate(rows, 1):
+            end = row["time"] + max(2.0, len(row["text"].split()) / 2.6)
+            fh.write("%d\n%s --> %s\n%s\n\n"
+                     % (i, srt_time(row["time"]), srt_time(end), row["text"]))
+    if not quiet:
+        say("Wrote %s" % os.path.basename(md))
+        say("Wrote %s" % os.path.basename(srt))
+    return md, srt
+
+
+def eleven_key():
+    out = run(["security", "find-generic-password", "-s", "elevenlabs-api-key", "-w"])
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def speak(rows, folder, voice, quiet):
+    """One clip per description. Returns [(path, when)] for whatever rendered."""
+    import urllib.request
+    key = eleven_key()
+    if not key:
+        say("No ElevenLabs key in the Keychain, so nothing can be spoken.")
+        return []
+    os.makedirs(folder, exist_ok=True)
+    clips = []
+    for i, row in enumerate(rows):
+        path = os.path.join(folder, "d%04d.mp3" % i)
+        body = json.dumps({"text": row["text"], "model_id": "eleven_v3",
+                           "voice_settings": {"stability": 0.5,
+                                              "similarity_boost": 0.75}}).encode()
+        req = urllib.request.Request(
+            ELEVEN % voice, data=body,
+            headers={"xi-api-key": key, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp, open(path, "wb") as fh:
+                fh.write(resp.read())
+            clips.append((path, row["time"]))
+        except Exception as exc:
+            say("  could not speak line %d: %s" % (i + 1, exc))
+        if not quiet and (i + 1) % 10 == 0:
+            say("  spoken %d of %d..." % (i + 1, len(rows)))
+    return clips
+
+
+def mix(clips, source_audio, out_path, quiet):
+    """Lay the description over the original, ducking it underneath.
+
+    Real audio description goes strictly in the gaps. Fitting to gaps needs
+    editorial judgement about which line matters more than which sentence of
+    dialogue, which this cannot do — so it ducks instead, and says so, rather
+    than silently talking over something important.
+    """
+    if not clips:
+        return None
+    inputs, filters, labels = ["-i", source_audio], [], []
+    for i, (path, when) in enumerate(clips):
+        inputs += ["-i", path]
+        filters.append("[%d:a]adelay=%d|%d[d%d]" % (i + 1, int(when * 1000),
+                                                    int(when * 1000), i))
+        labels.append("[d%d]" % i)
+
+    # Duck the original wherever description is playing.
+    filters.append("%samix=inputs=%d:normalize=0[desc]" % ("".join(labels), len(labels)))
+    filters.append("[0:a][desc]sidechaincompress=threshold=0.05:ratio=8:"
+                   "attack=20:release=400[ducked]")
+    filters.append("[ducked][desc]amix=inputs=2:normalize=0[out]")
+
+    out = run([need("ffmpeg", ""), "-y"] + inputs +
+              ["-filter_complex", ";".join(filters), "-map", "[out]",
+               "-c:a", "aac", "-b:a", "192k", out_path], timeout=1800)
+    if out.returncode != 0:
+        say("Mixing failed. The description files are still there.")
+        tail = [l for l in (out.stderr or "").splitlines() if l.strip()][-3:]
+        for line in tail:
+            say("  " + line)
+        return None
+    if not quiet:
+        say("Wrote %s" % os.path.basename(out_path))
+    return out_path
+
+
+# ---------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("url")
+    ap.add_argument("--to", default=DEST)
+    ap.add_argument("--generate", action="store_true",
+                    help="skip the search for an authored version")
+    ap.add_argument("--no-search", dest="search", action="store_false")
+    ap.add_argument("--frames", type=int, default=40)
+    ap.add_argument("--voice", default=DEFAULT_VOICE)
+    ap.add_argument("--spoken", action="store_true", help="also render speech")
+    ap.add_argument("--mix", action="store_true",
+                    help="also mix that speech with the original audio")
+    ap.add_argument("--keep-video", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    ytdlp = need("yt-dlp", "Install it with: brew install yt-dlp")
+    need("ffmpeg", "Install it with: brew install ffmpeg")
+    args.to = os.path.abspath(os.path.expanduser(args.to))
+    os.makedirs(args.to, exist_ok=True)
+    quiet = args.quiet
+
+    out = run([ytdlp, "-J", "--no-playlist", "--no-warnings", args.url], timeout=180)
+    if out.returncode != 0:
+        sys.exit("Could not read that video.\n%s" % (out.stderr or "").strip()[-300:])
+    info = json.loads(out.stdout)
+    title = info.get("title") or "video"
+    base = os.path.join(args.to, safe_name(title))
+
+    if not quiet:
+        say(title)
+        say()
+
+    # 1 -----------------------------------------------------------------
+    track = descriptive_track(info)
+    if track:
+        say("This video has a described audio track — using it, "
+            "rather than inventing one.")
+        cmd = [ytdlp, "-f", str(track.get("format_id")), "-x",
+               "--audio-format", "best", "-o", base + ".described.%(ext)s",
+               "--no-playlist", "--no-warnings", args.url]
+        if run(cmd, timeout=1800).returncode == 0:
+            say("Saved the authored description track.")
+            return
+        say("That track would not download; carrying on.")
+
+    # 2 -----------------------------------------------------------------
+    if args.search and not args.generate:
+        hits = find_described_version(title, quiet)
+        if hits:
+            say()
+            say("Found %d video%s that may already be described:"
+                % (len(hits), "" if len(hits) == 1 else "s"))
+            for i, hit in enumerate(hits, 1):
+                say("%2d. %s" % (i, hit["title"][:88]))
+            say()
+            say("These are a title-match only — I have not confirmed any of "
+                "them is the same footage.")
+            if sys.stdin.isatty():
+                try:
+                    answer = input("Number to download, or Enter to generate "
+                                   "instead: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ""
+                if answer.isdigit() and 1 <= int(answer) <= len(hits):
+                    chosen = hits[int(answer) - 1]
+                    say("Downloading: %s" % chosen["title"])
+                    code = run([ytdlp, "-x", "--audio-format", "best",
+                                "-o", base + ".described-by-someone-else.%(ext)s",
+                                "--no-playlist", "--no-warnings",
+                                chosen["url"]], timeout=1800).returncode
+                    say("Done." if code == 0 else "That download failed.")
+                    return
+            else:
+                say("Re-run in a terminal to pick one, or pass --generate.")
+
+    # 3 -----------------------------------------------------------------
+    if not quiet:
+        say()
+        say("Generating a description. This is invented, not authored — "
+            "every file says so.")
+
+    work = os.path.join(SCRATCH, safe_name(title))
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work, exist_ok=True)
+    video = os.path.join(work, "video.mp4")
+
+    if not quiet:
+        say("Fetching the picture (480p is plenty to read)...")
+    got = run([ytdlp, "-f", "bv*[height<=480]+ba/b[height<=480]/b",
+               "--merge-output-format", "mp4", "-o", video,
+               "--no-playlist", "--no-warnings", args.url], timeout=3600)
+    if got.returncode != 0 or not os.path.exists(video):
+        sys.exit("Could not download the video to read it.\n%s"
+                 % (got.stderr or "").strip()[-300:])
+
+    frames = sample_frames(video, os.path.join(work, "frames"), args.frames, quiet)
+    if not frames:
+        sys.exit("No frames came out of the video, so there is nothing to describe.")
+
+    rows = describe_frames(frames, title, quiet)
+    if not rows:
+        sys.exit("Nothing usable came back from the description pass.")
+
+    write_text(rows, base, title, authored=False, quiet=quiet)
+
+    if args.spoken or args.mix:
+        if not quiet:
+            say("Speaking %d line%s..." % (len(rows), "" if len(rows) == 1 else "s"))
+        clips = speak(rows, os.path.join(work, "speech"), args.voice, quiet)
+        if clips and args.mix:
+            audio = os.path.join(work, "original.m4a")
+            run([need("ffmpeg", ""), "-y", "-i", video, "-vn",
+                 "-c:a", "aac", "-b:a", "192k", audio], timeout=900)
+            mix(clips, audio, base + ".described.m4a", quiet)
+        elif clips:
+            only = os.path.join(work, "silence.wav")
+            length = float(info.get("duration") or 0) + 5
+            run([need("ffmpeg", ""), "-y", "-f", "lavfi", "-i",
+                 "anullsrc=r=44100:cl=stereo", "-t", str(length), only], timeout=600)
+            mix(clips, only, base + ".description-only.m4a", quiet)
+
+    if args.keep_video:
+        shutil.move(video, base + ".source.mp4")
+        say("Kept the video as %s" % os.path.basename(base + ".source.mp4"))
+    else:
+        shutil.rmtree(work, ignore_errors=True)
+
+    if not quiet:
+        say()
+        say("Done. Remember this description was generated, not written.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        say()
+        sys.exit(130)

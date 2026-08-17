@@ -1,7 +1,12 @@
 # ytdl-accessible
 
 A screen-reader-friendly wrapper around [yt-dlp](https://github.com/yt-dlp/yt-dlp) for macOS,
-plus a small app so it can be launched from the Applications folder.
+plus a small app so it can be launched from the Applications folder, and a tool that
+produces audio description for a video.
+
+**Not YouTube-only.** yt-dlp handles about 1,750 sites — Bandcamp, SoundCloud, Vimeo,
+the BBC, archive.org, Mixcloud — and falls back to a generic attempt on any plain media
+link. `ytdl --sites bandcamp` checks a specific one.
 
 ## Why this exists
 
@@ -20,7 +25,7 @@ Journey Uptown — Matthew Whitaker
 6 minutes 42 seconds. About 8 MB.
 Downloading...
 
-Done. Saved to Youtube Downloads as Journey Uptown.opus (7.9 MB)
+Done. Saved to Media Downloads as Journey Uptown.opus (7.9 MB)
 ```
 
 `--progress` adds a percentage line at most **every 10 seconds** — slow enough that
@@ -41,6 +46,10 @@ brew install yt-dlp ffmpeg
 Homebrew pulls in `deno` alongside yt-dlp, which is what satisfies YouTube's
 player challenge. Nothing else is needed.
 
+For `ytdescribe` you also want the `claude` CLI on your PATH (it reads the frames)
+and, for the spoken track, an ElevenLabs key in the macOS Keychain as
+`elevenlabs-api-key`. Both are optional; the text description needs only `claude`.
+
 ## Install
 
 ```bash
@@ -51,7 +60,7 @@ ln -s ~/ytdl-accessible/ytdl ~/bin/ytdl     # anywhere on your PATH
 Optionally, build the Mac app:
 
 ```bash
-osacompile -o "/Applications/YouTube Download.app" ~/ytdl-accessible/YouTubeDownload.applescript
+osacompile -o "/Applications/Media Download.app" ~/ytdl-accessible/MediaDownload.applescript
 ```
 
 ## Usage
@@ -95,6 +104,7 @@ ytdl <url> --info          what you would get, downloads nothing
 **Everything else**
 
 ```
+  --sites bandcamp         is a site supported? (about 1,750 are)
   --to PATH                a different folder, just this once
   --name "..."             filename, without extension
   --progress               a percentage line every 10 seconds, no faster
@@ -105,9 +115,15 @@ ytdl <url> --info          what you would get, downloads nothing
   --no-auto-update         never upgrade yt-dlp on its own
 ```
 
-Downloads default to `~/Library/Mobile Documents/com~apple~CloudDocs/Youtube Downloads`
+Downloads default to `~/Library/Mobile Documents/com~apple~CloudDocs/Media Downloads`
 (iCloud Drive). `ytdl --set-default --to ~/Music` changes that for good; `--to` changes
 it for one run.
+
+**`best` never converts; a named format sometimes must.** `--format best` keeps the
+source codec, so a Bandcamp FLAC stays FLAC and an MP3 stays an MP3. Naming a format
+(`m4a`, `mp3`, `wav`) guarantees the file type but converts when the source is not
+already that codec — a lossy generation for the lossy ones. Measured on a plain MP3:
+`best` kept it at 32 KB, `--format m4a` re-encoded it to 67 KB. Bigger *and* lossier.
 
 **Nothing here ever opens a file.** Downloads are written and left alone, so whatever
 app owns the format on your Mac is never launched. If double-clicking a download opens
@@ -130,6 +146,13 @@ only changes the container: AAC lands as `.m4a`, Opus as `.opus`. Preferring `.m
 for tidiness would give you the *worse* stream — YouTube's Opus is typically ~106 kbps
 against the AAC's ~130 kbps, and Opus wins comfortably at that bitrate. `--mp3` and
 `--wav` are conversions, and the help text says so.
+
+**Playlist detection cannot key on `list=`.** That is a YouTube URL parameter, so a
+Bandcamp album or a SoundCloud set sailed straight past the guard. Every other site
+announces itself in the metadata instead, and YouTube is the one that does *not* —
+`--no-playlist` collapses it to a single video before you can see it. So both signals
+are checked. Error messages name the actual extractor too; blaming YouTube for a
+Bandcamp failure is both wrong and confusing.
 
 **`--info` asks yt-dlp what it would pick** rather than ranking the formats itself.
 It passes the same `-f` selector the download will use into the `-J` call and reads
@@ -221,3 +244,38 @@ custom sounds named `ytdl-done` and `ytdl-fail`, or edit those constants.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## `ytdescribe` — audio description
+
+```
+ytdescribe <url>              find or make a description
+ytdescribe <url> --spoken     also render it as speech
+ytdescribe <url> --mix        also mix that speech under the original audio
+```
+
+Three sources, in descending order of how much they are worth trusting.
+
+**1. A descriptive audio track on the video itself.** Rare, but real human
+description. Checked first, always, and across every metadata field that has carried
+it — the shape differs by site and has changed more than once, and a missed track
+means inventing description that a person already wrote.
+
+**2. A separate video that IS the described version.** This is where audio description
+actually lives on YouTube. Searching "audio described" turns up whole channels of them,
+published as their own videos rather than as alternate tracks — which is worth knowing,
+because looking only for alternate tracks finds almost nothing. You are shown the
+candidates and pick one; a title match is not treated as proof.
+
+**3. Generated, only when the first two come up empty.** Frames are sampled at *shot
+changes* rather than on a fixed clock — a fixed interval either misses a cut or
+describes the same shot five times. They are then read **in order and in batches**, so
+the description has continuity and can refer back ("the same room") instead of being a
+list of disconnected stills.
+
+It is invented description, and **every file it writes says so at the top.** A
+confident wrong description is worse than an honest gap.
+
+The spoken mix **ducks the original rather than fitting the gaps.** Real audio
+description goes strictly in the pauses, but choosing which line matters more than
+which sentence of dialogue is an editorial judgement this cannot make. Ducking is the
+honest compromise, and it is named as one.

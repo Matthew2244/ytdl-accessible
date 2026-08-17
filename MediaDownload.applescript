@@ -1,4 +1,5 @@
--- YouTube Download — a launcher for ~/bin/ytdl.
+-- Media Download — a launcher for ~/bin/ytdl.
+-- Not YouTube-only: yt-dlp handles about 1,750 sites.
 --
 -- Dialogs rather than a Terminal window: every dialog here is readable by
 -- VoiceOver, and a scrolling terminal is exactly what ytdl exists to avoid.
@@ -10,7 +11,7 @@
 
 property shellPrefix : "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
 property ytdlPath : "$HOME/bin/ytdl"
-property appTitle : "YouTube Download"
+property appTitle : "Media Download"
 
 on run
 	-- Prefill from the clipboard. Copying a link and then launching this is
@@ -23,7 +24,7 @@ on run
 	end try
 
 	try
-		set urlReply to display dialog "Paste or edit the link:" default answer startURL with title appTitle buttons {"Cancel", "Continue"} default button "Continue"
+		set urlReply to display dialog "Paste or edit the link (any site, not just YouTube):" default answer startURL with title appTitle buttons {"Cancel", "Continue"} default button "Continue"
 	on error number -128
 		return
 	end try
@@ -51,11 +52,11 @@ on run
 	-- worse than silently taking one.
 	if theURL contains "list=" then
 		set plAnswer to button returned of (display dialog ¬
-			"That link is part of a playlist." with title appTitle ¬
-			buttons {"Cancel", "Just this video", "Whole playlist"} ¬
-			default button "Just this video")
+			"That link is part of a set." with title appTitle ¬
+			buttons {"Cancel", "Just this one", "The whole set"} ¬
+			default button "Just this one")
 		if plAnswer is "Cancel" then return
-		if plAnswer is "Whole playlist" then set theFlag to theFlag & " --playlist"
+		if plAnswer is "The whole set" then set theFlag to theFlag & " --playlist"
 	end if
 
 	-- Check the link before starting anything, so a bad paste or an
