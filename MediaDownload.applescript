@@ -45,6 +45,14 @@ on run
 			if not mainScreen() then exit repeat
 		on error number -128
 			-- Escape that got past a closer handler. Never closes the app.
+		on error errText number errNum
+			if errNum is -1712 then
+				my tell_("That took too long and was given up on." & return & return & ¬
+					"Nothing was damaged. If it was an update, try again — " & ¬
+					"Homebrew is sometimes slow the first time.")
+			else
+				my tell_("Something went wrong:" & return & return & errText)
+			end if
 		end try
 	end repeat
 end run
@@ -78,9 +86,33 @@ on pick(theList)
 	return item (random number from 1 to (count of theList)) of theList
 end pick
 
+-- Apple events time out after 120 seconds by default. Matthew hit
+-- "AppleEvent timed out. (-1712)" from this app, and the calls that can
+-- plausibly run that long are `--update` (a brew upgrade takes minutes) and
+-- `--info` on a slow link (yt-dlp waits up to 180 seconds of its own).
+--
+-- Raising the timeout here is the documented remedy. Worth being straight
+-- about the evidence though: a short-timeout reproduction did not fire, so
+-- this is the known fix for the known cause rather than something reproduced
+-- from first principles. It costs nothing if the cause was elsewhere, and the
+-- -1712 handler below means a recurrence reports itself in words either way.
 on ytdl(argsText)
-	return do shell script shellPrefix & ytdlPath & " " & argsText
+	with timeout of 1800 seconds
+		return do shell script shellPrefix & ytdlPath & " " & argsText
+	end timeout
 end ytdl
+
+-- The same, but reports a timeout in words instead of a number.
+on ytdlSlow(argsText, whatItIs)
+	try
+		return my ytdl(argsText)
+	on error errText number errNum
+		if errNum is -1712 then
+			return whatItIs & " took too long and was given up on."
+		end if
+		error errText number errNum
+	end try
+end ytdlSlow
 
 on settingValue(theKey)
 	try
@@ -215,7 +247,7 @@ on mainScreen()
 
 	if howMany is 1 then
 		try
-			set infoText to my ytdl(quoted_urls & theFlag & " --info")
+			set infoText to my ytdlSlow(quoted_urls & theFlag & " --info", "Reading that link")
 		on error errText
 			my tell_("That didn't work." & return & return & errText & return & return & ¬
 				"Nothing was downloaded.")
@@ -256,8 +288,7 @@ end mainScreen
 -- "" if nothing was chosen.
 on pickEpisodes(quotedURL)
 	try
-		set raw to do shell script shellPrefix & ytdlPath & " --list-items " & ¬
-			quotedURL & " --plain"
+		set raw to my ytdl("--list-items " & quotedURL & " --plain")
 	on error errText
 		my tell_("Could not read that playlist." & return & return & errText)
 		return ""
@@ -392,7 +423,10 @@ on settingsScreen()
 				my tell_(my ytdl("--sites " & quoted form of q))
 
 			else if what starts with "Update yt-dlp" then
-				my tell_(my ytdl("--update"))
+				display dialog "This can take a few minutes. Nothing will happen on screen while it runs." ¬
+					with title appTitle buttons {"Cancel", "Update"} ¬
+					default button "Update" cancel button "Cancel"
+				my tell_(my ytdlSlow("--update", "The update"))
 			end if
 		on error number -128
 			-- Escape inside any of the above just returns to this list.
