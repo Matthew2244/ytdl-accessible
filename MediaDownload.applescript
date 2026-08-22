@@ -1,4 +1,4 @@
--- Media Download — a launcher for ~/bin/ytdl.
+-- Media Download — a launcher for the ytdl command (found at launch, wherever install.sh put it).
 --
 -- Not YouTube-only: yt-dlp handles about 1,750 sites.
 --
@@ -33,12 +33,18 @@
 -- Homebrew is invisible to it and yt-dlp would not be found. Hence the
 -- explicit PATH on every shell call.
 
-property shellPrefix : "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; "
-property ytdlPath : "$HOME/bin/ytdl"
+property shellPrefix : "export PATH=$HOME/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH; "
+-- Resolved at every launch by locateYtdl(), never assumed. install.sh links
+-- ytdl into whichever personal folder is on the PATH (~/bin on one Mac,
+-- ~/.local/bin on another), so a fixed "$HOME/bin/ytdl" was wrong on any
+-- machine but the one it was written on, and every setting change failed with
+-- "No such file or directory".
+property ytdlPath : ""
 property appTitle : "Media Download"
 property welcomeFlag : "$HOME/.config/ytdl/.welcomed"
 
 on run
+	if not locateYtdl() then return
 	greetOnce()
 	repeat
 		try
@@ -98,6 +104,26 @@ end pick
 -- this is the known fix for the known cause rather than something reproduced
 -- from first principles. It costs nothing if the cause was elsewhere, and the
 -- -1712 handler below means a recurrence reports itself in words either way.
+-- Find the ytdl command. Looks in the personal bin folders first, then
+-- anything on the (extended) PATH. Returns false, after explaining, if it is
+-- nowhere; the app cannot do anything without it.
+on locateYtdl()
+	set found to ""
+	try
+		set found to do shell script shellPrefix & ¬
+			"for c in \"$HOME/bin/ytdl\" \"$HOME/.local/bin/ytdl\" /opt/homebrew/bin/ytdl /usr/local/bin/ytdl; do " & ¬
+			"[ -x \"$c\" ] && { printf %s \"$c\"; exit 0; }; done; command -v ytdl"
+	end try
+	if found is "" then
+		my tell_("I can't find the ytdl command on this Mac, so there's nothing I can do yet." & return & return & ¬
+			"Run install.sh from the ytdl-accessible folder in Terminal. It links ytdl onto your PATH and rebuilds this app. " & ¬
+			"If you already ran it, it said which folder it used; make sure that folder is on your PATH.")
+		return false
+	end if
+	set ytdlPath to quoted form of found
+	return true
+end locateYtdl
+
 on ytdl(argsText)
 	with timeout of 1800 seconds
 		return do shell script shellPrefix & ytdlPath & " " & argsText
